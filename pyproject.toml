@@ -1,0 +1,53 @@
+[project]
+name = "mu-llama"
+version = "0.1.0"
+description = "MU-LLaMA: Music Understanding Large Language Model for Music Question Answering"
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+    "autofaiss==2.15.8",
+    "diffusers==0.17.0",
+    "easydict==1.10",
+    "fairscale==0.4.13",
+    "gradio==3.45.0",
+    "huggingface-hub==0.15.1",
+    "knn-cuda",
+    "opencv-python==4.7.0.72",
+    "pillow==9.5.0",
+    "plotly==5.15.0",
+    "sentencepiece==0.1.99",
+    "tensorboard==2.12.3",
+    "torchaudio==2.0.2",
+    "tqdm==4.65.0",
+    "transformers==4.30.2",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+dev-dependencies = [
+    "pytest>=7.0.0",
+    "black>=22.0.0",
+    "isort>=5.0.0",
+    "flake8>=4.0.0",
+    "mypy>=0.910",
+]
+
+[tool.uv.sources]
+knn-cuda = { url = "https://github.com/unlimblue/KNN_CUDA/releases/download/0.2/KNN_CUDA-0.2-py3-none-any.whl" }
+
+[tool.black]
+line-length = 88
+target-version = ['py38']
+
+[tool.isort]
+profile = "black"
+line_length = 88
+
+[tool.mypy]
+python_version = "3.8"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
