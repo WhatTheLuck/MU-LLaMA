@@ -1,0 +1,9 @@
+base: base.yaml
+experiment:
+  name: 00_baseline_peft
+model:
+  dissonance:
+    enabled: false
+training:
+  trainable_mode: baseline_peft
+

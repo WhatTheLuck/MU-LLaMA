@@ -1,0 +1,16 @@
+base: base.yaml
+experiment:
+  name: 01_ds_default
+model:
+  dissonance:
+    encoder:
+      type: cnn_small
+    fusion:
+      gate: scalar
+      position: pre_proj
+    feature:
+      bins_per_octave: 72
+      hop_length: 1024
+training:
+  trainable_mode: ds_plus_lora
+

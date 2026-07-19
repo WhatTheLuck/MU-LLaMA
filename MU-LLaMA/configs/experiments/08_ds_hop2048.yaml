@@ -1,0 +1,9 @@
+base: 01_ds_default.yaml
+experiment:
+  name: 08_ds_hop2048
+model:
+  dissonance:
+    feature:
+      bins_per_octave: 72
+      hop_length: 2048
+

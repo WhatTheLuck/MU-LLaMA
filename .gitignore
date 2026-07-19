@@ -58,6 +58,11 @@ Thumbs.db
 
 # Logs
 *.log
+outputs/
+MU-LLaMA/outputs/
+MU-LLaMA/cache/dissonance/
+MU-LLaMA/slurm/logs/
+.tmp-doc-review/
 
 # Data files
 *.csv

@@ -1,55 +1,113 @@
-from rouge_score import rouge_scorer
-from nltk.translate.bleu_score import sentence_bleu
-from nltk.translate.meteor_score import meteor_score as meteor_scorer
-from nltk.tokenize import wordpunct_tokenize
+"""Reusable, dependency-tolerant text evaluation for MU-LLaMA predictions."""
+
+from __future__ import annotations
+
+import argparse
 import json
-from bert_score import score
-from tqdm.auto import tqdm
-
-scorer = rouge_scorer.RougeScorer(['rougeL'], use_stemmer=True)
-
-mullama_data = json.load(open("./results/mullama_data.json", "r"))
-ltu_data = json.load(open("./results/ltu_data.json", "r"))
-llama_data = json.load(open("./results/llama-adapter_data.json", "r"))
-
-mtg_data = json.load(open("../MusicQA/MusicQA/EvalMusicQA.json", "r"))
-
-def evaluate(model_name, candidates, mult_reference):
-    rouge_score, bleu_score, bleu4_score, meteor_score = 0, 0, 0, 0
-    for ref, cand in tqdm(zip(mult_reference, candidates), total=len(mult_reference)):
-        rouge_score += scorer.score(ref, cand)['rougeL'].recall
-        cand_split = wordpunct_tokenize(cand)
-        ref_split = wordpunct_tokenize(ref)
-        bleu4_score += sentence_bleu([ref], cand, weights=(0.0, 0.0, 0.0, 1.0))
-        bleu_score += sentence_bleu([ref], cand)
-        meteor_score += meteor_scorer([ref_split], cand_split)
-    rouge_score, bleu_score, bleu4_score, meteor_score = rouge_score / (len(candidates)), bleu_score / (len(candidates)), bleu4_score / (len(candidates)), meteor_score / (len(candidates))
-    P, R, F1 = score(candidates, mult_reference, lang="en", verbose=True)
-    bert_score = R.mean().item()
-    print(f"Model: {model_name}")
-    print(f"BLEU Score: {bleu_score}")
-    print(f"BLEU-4 Score: {bleu4_score}")
-    print(f"METEOR Score: {meteor_score}")
-    print(f"ROUGE Score: {rouge_score}")
-    print(f"BERT Score: {bert_score}")
+from pathlib import Path
+from statistics import mean
+from typing import Any, Dict, List, Tuple
 
 
-reference = {"LTU": [], "LLaMA Adapter": [], "MU-LLaMA": []}
-candidates = {"LTU": [], "LLaMA Adapter": [], "MU-LLaMA": []}
+def evaluate_records(records: List[dict]) -> Tuple[Dict[str, Any], List[dict]]:
+    augmented = [dict(record) for record in records]
+    if not augmented:
+        return {"sample_count": 0, "missing_dependencies": []}, augmented
+    references = [str(record.get("reference", "")) for record in augmented]
+    predictions = [str(record.get("prediction", "")) for record in augmented]
+    metrics: Dict[str, Any] = {"sample_count": len(augmented)}
+    missing = []
 
-for row in tqdm(mtg_data):
-    audio = row["audio_name"]
-    if audio in ltu_data and row["conversation"][0]["value"] in ltu_data[audio]:
-        candidates["LTU"].append(ltu_data[audio][row["conversation"][0]["value"]])
-        reference["LTU"].append(row["conversation"][1]["value"])
-    if audio in mullama_data and row["conversation"][0]["value"] in mullama_data[audio]:
-        candidates["MU-LLaMA"].append(mullama_data[audio][row["conversation"][0]["value"]])
-        reference["MU-LLaMA"].append(row["conversation"][1]["value"])
-    if audio in llama_data and row["conversation"][0]["value"] in llama_data[audio]:
-        candidates["LLaMA Adapter"].append(llama_data[audio][row["conversation"][0]["value"]])
-        reference["LLaMA Adapter"].append(row["conversation"][1]["value"])
+    try:
+        from nltk.tokenize import wordpunct_tokenize
+        from nltk.translate.bleu_score import SmoothingFunction, sentence_bleu
+
+        smoothing = SmoothingFunction().method1
+        bleu_values = []
+        bleu4_values = []
+        for record, reference, prediction in zip(augmented, references, predictions):
+            ref_tokens = wordpunct_tokenize(reference)
+            pred_tokens = wordpunct_tokenize(prediction)
+            bleu = sentence_bleu([ref_tokens], pred_tokens, smoothing_function=smoothing)
+            bleu4 = sentence_bleu(
+                [ref_tokens], pred_tokens, weights=(0.0, 0.0, 0.0, 1.0),
+                smoothing_function=smoothing,
+            )
+            record["bleu"] = float(bleu)
+            record["bleu4"] = float(bleu4)
+            bleu_values.append(float(bleu))
+            bleu4_values.append(float(bleu4))
+        metrics["bleu"] = mean(bleu_values)
+        metrics["bleu4"] = mean(bleu4_values)
+    except Exception as error:
+        missing.append(f"BLEU (nltk): {error}")
+
+    try:
+        from nltk.tokenize import wordpunct_tokenize
+        from nltk.translate.meteor_score import meteor_score
+
+        values = []
+        for record, reference, prediction in zip(augmented, references, predictions):
+            value = float(meteor_score([wordpunct_tokenize(reference)], wordpunct_tokenize(prediction)))
+            record["meteor"] = value
+            values.append(value)
+        metrics["meteor"] = mean(values)
+    except Exception as error:
+        missing.append(f"METEOR (nltk/resources): {error}")
+
+    try:
+        from rouge_score import rouge_scorer
+
+        scorer = rouge_scorer.RougeScorer(["rougeL"], use_stemmer=True)
+        values = []
+        for record, reference, prediction in zip(augmented, references, predictions):
+            value = float(scorer.score(reference, prediction)["rougeL"].fmeasure)
+            record["rouge_l"] = value
+            values.append(value)
+        metrics["rouge_l"] = mean(values)
+    except Exception as error:
+        missing.append(f"ROUGE-L (rouge-score): {error}")
+
+    try:
+        from bert_score import score as bert_score
+
+        precision, recall, f1 = bert_score(predictions, references, lang="en", verbose=False)
+        p_values = precision.detach().cpu().tolist()
+        r_values = recall.detach().cpu().tolist()
+        f_values = f1.detach().cpu().tolist()
+        for record, p_value, r_value, f_value in zip(augmented, p_values, r_values, f_values):
+            record["bertscore_precision"] = float(p_value)
+            record["bertscore_recall"] = float(r_value)
+            record["bertscore_f1"] = float(f_value)
+        metrics.update({
+            "bertscore_precision": mean(p_values),
+            "bertscore_recall": mean(r_values),
+            "bertscore_f1": mean(f_values),
+        })
+    except Exception as error:
+        missing.append(f"BERTScore (bert-score/model): {error}")
+
+    metrics["missing_dependencies"] = missing
+    return metrics, augmented
 
 
-for model, val in candidates.items():
-    evaluate(model, val, reference[model])
+def read_jsonl(path: Path) -> List[dict]:
+    with path.open("r", encoding="utf-8") as handle:
+        return [json.loads(line) for line in handle if line.strip()]
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--predictions", required=True, type=Path)
+    parser.add_argument("--output", type=Path)
+    args = parser.parse_args()
+    metrics, records = evaluate_records(read_jsonl(args.predictions))
+    print(json.dumps(metrics, ensure_ascii=False, indent=2))
+    if args.output:
+        args.output.write_text(json.dumps(metrics, ensure_ascii=False, indent=2), encoding="utf-8")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
 

@@ -1,0 +1,8 @@
+base: 01_ds_default.yaml
+experiment:
+  name: 05_ds_mlp_encoder
+model:
+  dissonance:
+    encoder:
+      type: mlp_pool
+

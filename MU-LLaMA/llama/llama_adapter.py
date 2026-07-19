@@ -9,6 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .llama import Transformer, ModelArgs, RMSNorm
+from .dissonance_modules import GatedResidualFusion, build_ds_encoder
 from .tokenizer import Tokenizer
 from util.misc import download
 from .utils import sample_top_p
@@ -23,7 +24,7 @@ class LLaMA_adapter(nn.Module):
     """
 
     def __init__(self, llama_ckpt_dir, llama_tokenizer, mert_path, knn=False, knn_dir="./ckpts", phase="finetune",
-                 legacy_bridge=False):
+                 legacy_bridge=False, dissonance_config=None, trainable_mode=None):
         super().__init__()
 
         # 1. mert, mert aggregator and mert projector
@@ -35,6 +36,32 @@ class LLaMA_adapter(nn.Module):
         self.mert_processor = Wav2Vec2FeatureExtractor.from_pretrained(mert_path, trust_remote_code=True)
         self.mu_mert_agg = nn.Conv1d(in_channels=25, out_channels=1, kernel_size=1)
         self.mu_mert_proj = nn.Linear(1024, 4096)
+
+        self.dissonance_config = dict(dissonance_config or {})
+        self.dissonance_enabled = bool(self.dissonance_config.get("enabled", False))
+        self.ds_encoder = None
+        self.ds_fusion = None
+        self.ds_fusion_position = None
+        self.last_dissonance_stats = {}
+        if self.dissonance_enabled:
+            encoder_config = self.dissonance_config.get("encoder", {})
+            fusion_config = self.dissonance_config.get("fusion", {})
+            feature_config = self.dissonance_config.get("feature", {})
+            frequency_bins = int(feature_config.get("n_octaves", 8)) * int(
+                feature_config.get("bins_per_octave", 72)
+            )
+            embedding_dim = int(encoder_config.get("embedding_dim", 1024))
+            self.ds_fusion_position = fusion_config.get("position", "pre_proj")
+            if self.ds_fusion_position not in {"pre_proj", "post_proj"}:
+                raise ValueError("fusion.position must be 'pre_proj' or 'post_proj'")
+            self.ds_encoder = build_ds_encoder(encoder_config, frequency_bins)
+            self.ds_fusion = GatedResidualFusion(
+                base_dim=1024 if self.ds_fusion_position == "pre_proj" else 4096,
+                ds_dim=embedding_dim,
+                hidden_dim=int(fusion_config.get("hidden_dim", encoder_config.get("hidden_dim", 256))),
+                gate=fusion_config.get("gate", "scalar"),
+                gate_bias_init=float(fusion_config.get("gate_bias_init", -2.0)),
+            )
 
         if legacy_bridge:
             bridge_norm_layer = nn.LayerNorm
@@ -148,15 +175,25 @@ class LLaMA_adapter(nn.Module):
         self.criterion = torch.nn.CrossEntropyLoss(ignore_index=0)
 
         self.phase = phase
-        self.set_default_trainability(self.phase)
+        self.trainable_mode = trainable_mode or ("baseline_peft" if phase == "finetune" else phase)
+        self.set_default_trainability(self.phase, self.trainable_mode)
 
-    def get_trainable_params(self, phase='finetune'):
+    def get_trainable_params(self, phase='finetune', trainable_mode=None):
         trainable = {}
         if phase == 'finetune':
+            mode = trainable_mode or self.trainable_mode
+            if mode not in {"ds_only", "ds_plus_lora", "baseline_peft"}:
+                raise ValueError(f"Unknown trainable mode: {mode}")
+            if mode in {"ds_only", "ds_plus_lora"} and not self.dissonance_enabled:
+                raise ValueError(f"{mode} requires model.dissonance.enabled=true")
+            if mode == "baseline_peft" and self.dissonance_enabled:
+                raise ValueError("baseline_peft requires model.dissonance.enabled=false")
             for name, para in self.named_parameters():
-                if name.startswith("llama."):
+                if mode in {"baseline_peft", "ds_plus_lora"} and name.startswith("llama."):
                     if 'norm' in name or 'bias' in name or 'lora' in name:
                         trainable[name] = para
+                if mode in {"ds_only", "ds_plus_lora"} and name.startswith(("ds_encoder.", "ds_fusion.")):
+                    trainable[name] = para
         elif phase == 'pretrain':
             for name, para in self.named_parameters():
                 if name.startswith("llama."):
@@ -170,10 +207,10 @@ class LLaMA_adapter(nn.Module):
             raise ValueError(f"Unknown model phase: {phase}")
         return trainable
 
-    def set_default_trainability(self, phase='finetune'):
+    def set_default_trainability(self, phase='finetune', trainable_mode=None):
         for key, value in self.named_parameters():
             value.requires_grad = False
-        for key, value in self.get_trainable_params(phase).items():
+        for key, value in self.get_trainable_params(phase, trainable_mode).items():
             value.data = value.data.float()
             value.requires_grad = True
 
@@ -183,14 +220,19 @@ class LLaMA_adapter(nn.Module):
         audio = resampler(y)
         return audio, target_sr
 
-    def encode_audio(self, x):
+    def encode_audio(self, x, audio_lengths=None):
         xs = []
-        for sub_x in x:
-            all_inputs = [self.mert_processor(sub_x[ix * self.mert_processor.sampling_rate:min(
-                (ix + 60) * self.mert_processor.sampling_rate, len(sub_x))],
-                                              sampling_rate=self.mert_processor.sampling_rate,
-                                              return_tensors="pt").to(self.device) for ix in
-                          range(0, len(sub_x) // (self.mert_processor.sampling_rate * 60) + 1, 60)]
+        for sample_index, sub_x in enumerate(x):
+            if audio_lengths is not None:
+                sub_x = sub_x[:int(audio_lengths[sample_index])]
+            # The official model uses the first 60 seconds. DS caches use the
+            # same segment so enabling DS does not alter the MERT baseline.
+            starts = [0]
+            all_inputs = [self.mert_processor(
+                sub_x[start:min(start + self.mert_processor.sampling_rate * 60, len(sub_x))],
+                sampling_rate=self.mert_processor.sampling_rate,
+                return_tensors="pt",
+            ).to(self.device) for start in starts]
             aggoutputs = torch.zeros(1, 25, 1024).to(self.device)
             for inputs in all_inputs:
                 with torch.no_grad():
@@ -204,11 +246,12 @@ class LLaMA_adapter(nn.Module):
         x = torch.stack(xs, dim=0)
         return x
 
-    def forward_audio(self, inputs, cache_size=10, cache_t=20, cache_weight=0.5):
+    def forward_audio(self, inputs, cache_size=10, cache_t=20, cache_weight=0.5,
+                      dissonance=None, dissonance_mask=None, audio_lengths=None):
         outputs = []
         outputs_weights = []
         for input_type, (input, input_weight) in inputs.items():
-            outputs.append(F.normalize(self.encode_audio(input), dim=-1))
+            outputs.append(F.normalize(self.encode_audio(input, audio_lengths=audio_lengths), dim=-1))
             outputs_weights.append(input_weight)
         outputs_weights = [x / (sum(outputs_weights) + 1e-6) for x in outputs_weights]
 
@@ -231,8 +274,26 @@ class LLaMA_adapter(nn.Module):
             audio_feats = (1 - cache_weight) * audio_feats_ori + cache_weight * audio_feats
             audio_feats = audio_feats / audio_feats.norm(dim=-1, keepdim=True)
 
+        self.last_dissonance_stats = {}
+        ds_embedding = None
+        ds_valid = None
+        if self.dissonance_enabled:
+            if dissonance is None or dissonance_mask is None:
+                raise ValueError("Dissonance Spectrum tensors are required when DS is enabled")
+            ds_embedding = self.ds_encoder(dissonance, dissonance_mask)
+            ds_valid = dissonance_mask.any(dim=-1)
+            if self.ds_fusion_position == "pre_proj":
+                audio_feats, self.last_dissonance_stats = self.ds_fusion(
+                    audio_feats, ds_embedding, ds_valid
+                )
+
         audio_feats = audio_feats.unsqueeze(1)  # B, 1, D
         audio_feats = self.mu_mert_proj(audio_feats)
+        if self.dissonance_enabled and self.ds_fusion_position == "post_proj":
+            fused, self.last_dissonance_stats = self.ds_fusion(
+                audio_feats.squeeze(1), ds_embedding, ds_valid
+            )
+            audio_feats = fused.unsqueeze(1)
         audio_feats_norm = self.mu_mert_norm_1(audio_feats)
         audio_feats = audio_feats + self.mu_mert_f2_1(
             F.silu(self.mu_mert_f1_1(audio_feats_norm)) * self.mu_mert_f3_1(audio_feats_norm))
@@ -271,8 +332,12 @@ class LLaMA_adapter(nn.Module):
 
         return output.float()
 
-    def forward(self, tokens, labels, imgs):
-        audio_feats = self.forward_audio({'Audio': [imgs, 1]})
+    def forward(self, tokens, labels, imgs, dissonance=None, dissonance_mask=None,
+                audio_lengths=None, return_sample_losses=False):
+        audio_feats = self.forward_audio(
+            {'Audio': [imgs, 1]}, dissonance=dissonance,
+            dissonance_mask=dissonance_mask, audio_lengths=audio_lengths,
+        )
 
         _bsz, seqlen = tokens.shape
 
@@ -304,6 +369,13 @@ class LLaMA_adapter(nn.Module):
             assert self.llama.vocab_size == 32000
             c_loss = self.criterion(output.reshape(-1, self.llama.vocab_size), labels.flatten())
 
+        if return_sample_losses:
+            token_losses = F.cross_entropy(
+                output.transpose(1, 2), labels, ignore_index=0, reduction="none"
+            )
+            valid_tokens = labels.ne(0)
+            sample_losses = (token_losses * valid_tokens).sum(dim=1) / valid_tokens.sum(dim=1).clamp_min(1)
+            return c_loss, c_loss, sample_losses
         return c_loss, c_loss
 
     @torch.inference_mode()
@@ -316,14 +388,21 @@ class LLaMA_adapter(nn.Module):
             top_p: float = 0.75,
             cache_size=10,
             cache_t=20,
-            cache_weight=0.5
+            cache_weight=0.5,
+            dissonance=None,
+            dissonance_mask=None,
+            audio_lengths=None,
     ):
         bsz = len(prompts)
         params = self.llama.params
         assert bsz <= params.max_batch_size, (bsz, params.max_batch_size)
 
         with torch.cuda.amp.autocast():
-            audio_query = self.forward_audio(inputs, cache_size, cache_t, cache_weight)
+            audio_query = self.forward_audio(
+                inputs, cache_size, cache_t, cache_weight,
+                dissonance=dissonance, dissonance_mask=dissonance_mask,
+                audio_lengths=audio_lengths,
+            )
 
         if isinstance(prompts[0], str):
             prompts = [self.tokenizer.encode(x, bos=True, eos=False) for x in prompts]
@@ -333,10 +412,11 @@ class LLaMA_adapter(nn.Module):
 
         total_len = min(params.max_seq_len, max_gen_len + max_prompt_size)
 
-        tokens = torch.full((bsz, total_len), self.tokenizer.pad_id).cuda().long()
+        generation_device = audio_query.device
+        tokens = torch.full((bsz, total_len), self.tokenizer.pad_id, device=generation_device).long()
 
         for k, t in enumerate(prompts):
-            tokens[k, : len(t)] = torch.tensor(t).cuda().long()
+            tokens[k, : len(t)] = torch.tensor(t, device=generation_device).long()
         input_text_mask = tokens != self.tokenizer.pad_id
         start_pos = min_prompt_size
         prev_pos = 0
@@ -375,7 +455,8 @@ class LLaMA_adapter(nn.Module):
 
 
 def load(model_path, llama_dir, mert_path="m-a-p/MERT-v1-330M", device="cuda" if torch.cuda.is_available() else "cpu",
-         knn=False, knn_dir="./ckpts", llama_type="7B", phase="finetune"):
+         knn=False, knn_dir="./ckpts", llama_type="7B", phase="finetune",
+         dissonance_config=None, trainable_mode=None):
     llama_ckpt_dir = os.path.join(llama_dir, llama_type)
     llama_tokenzier_path = os.path.join(llama_dir, 'tokenizer.model')
 
@@ -383,12 +464,17 @@ def load(model_path, llama_dir, mert_path="m-a-p/MERT-v1-330M", device="cuda" if
     print(f'Loading LLaMA-Adapter from {model_path}')
     adapter_ckpt = torch.load(model_path, map_location='cpu')
     model_cfg = adapter_ckpt.get('config', {})
+    if dissonance_config is None:
+        dissonance_config = model_cfg.get("model", {}).get("dissonance")
+    if trainable_mode is None:
+        trainable_mode = model_cfg.get("training", {}).get("trainable_mode")
 
     # The model files for MERT can be downloaded here in case of network issues:
     # https://huggingface.co/m-a-p/MERT-v1-330M
     # And set the MERT argument to directory with the model files
     model = LLaMA_adapter(
-        llama_ckpt_dir, llama_tokenzier_path, mert_path, knn=knn, knn_dir=knn_dir, phase=phase)
+        llama_ckpt_dir, llama_tokenzier_path, mert_path, knn=knn, knn_dir=knn_dir, phase=phase,
+        dissonance_config=dissonance_config, trainable_mode=trainable_mode)
 
     load_result = model.load_state_dict(adapter_ckpt['model'], strict=False)
     assert len(load_result.unexpected_keys) == 0, f"Unexpected keys: {load_result.unexpected_keys}"

@@ -1,0 +1,6 @@
+base: 01_ds_default.yaml
+experiment:
+  name: 02_ds_only
+training:
+  trainable_mode: ds_only
+

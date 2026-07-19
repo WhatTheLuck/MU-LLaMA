@@ -1,0 +1,33 @@
+cluster:
+  workdir: .
+  log_dir: slurm/logs
+  partition: null
+  account: null
+  qos: null
+  nodes: 1
+  tasks: 1
+  cpus_per_task: 8
+  memory: 64G
+  time: "24:00:00"
+  gres: gpu:a100:1
+  python_executable: python
+  conda_env: null
+
+experiment_groups:
+  core:
+    - 00_baseline_peft
+    - cache_01_ds_default
+    - 01_ds_default
+    - 02_ds_only
+  architecture:
+    - 03_ds_channel_gate
+    - 04_ds_post_proj
+    - 05_ds_mlp_encoder
+  spectrum:
+    - cache_06_ds_bpo36
+    - 06_ds_bpo36
+    - cache_07_ds_hop512
+    - 07_ds_hop512
+    - cache_08_ds_hop2048
+    - 08_ds_hop2048
+

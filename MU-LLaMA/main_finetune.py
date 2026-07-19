@@ -7,7 +7,7 @@ import util.misc as misc
 from util.misc import NativeScalerWithGradNormCount as NativeScaler
 from llama.llama_adapter import LLaMA_adapter
 
-from data.dataset import FinetuneDataset, transform_train
+from data.dataset import FinetuneDataset, finetune_collate, transform_train
 
 import argparse
 import datetime
@@ -141,7 +141,8 @@ def main(args):
 
 
     dataset_train = FinetuneDataset(args.data_config, transform=transform_train,
-                                max_words=args.max_words, tokenizer_path=llama_tokenzier_path)
+                                max_words=args.max_words, tokenizer_path=llama_tokenzier_path,
+                                return_metadata=True)
     print(dataset_train)
     num_tasks = misc.get_world_size()
     global_rank = misc.get_rank()
@@ -156,6 +157,7 @@ def main(args):
         num_workers=args.num_workers,
         pin_memory=args.pin_mem,
         drop_last=True,
+        collate_fn=finetune_collate,
     )
 
     # SummaryWrite

@@ -327,8 +327,15 @@ def load_model(model_without_ddp, path):
     for key, value in checkpoint['model'].items():
         key = key.replace("llma", "llama")
         new_checkpoint[key] = value
-    print(model_without_ddp.load_state_dict(new_checkpoint, strict=False))
+    load_result = model_without_ddp.load_state_dict(new_checkpoint, strict=False)
+    print(load_result)
     print("Load checkpoint %s" % path)
+    return {
+        "path": str(path),
+        "loaded": True,
+        "missing_keys": list(load_result.missing_keys),
+        "unexpected_keys": list(load_result.unexpected_keys),
+    }
 
 
 def all_reduce_mean(x):

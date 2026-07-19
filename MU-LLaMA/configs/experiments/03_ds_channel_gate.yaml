@@ -1,0 +1,9 @@
+base: 01_ds_default.yaml
+experiment:
+  name: 03_ds_channel_gate
+model:
+  dissonance:
+    fusion:
+      gate: channel
+      position: pre_proj
+

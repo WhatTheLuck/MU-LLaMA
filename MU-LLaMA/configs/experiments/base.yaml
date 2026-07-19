@@ -1,0 +1,78 @@
+experiment:
+  name: base
+
+model:
+  llama_type: 7B
+  llama_path: ./ckpts/LLaMA
+  pretrained_path: ./ckpts/checkpoint.pth
+  mert_path: m-a-p/MERT-v1-330M
+  max_words: 512
+  dissonance:
+    enabled: true
+    cache_root: cache/dissonance
+    require_cache: true
+    segment_seconds: 60.0
+    encoder:
+      type: cnn_small
+      embedding_dim: 1024
+      hidden_dim: 256
+      dropout: 0.1
+    fusion:
+      type: gated_residual
+      gate: scalar
+      position: pre_proj
+      hidden_dim: 256
+      gate_bias_init: -2.0
+    feature:
+      reference_mode: tonic+self
+      auto_key_detect: true
+      auto_key_window_seconds: 10.0
+      sr: 22050
+      fps: 0.0
+      hop_length: 1024
+      n_octaves: 8
+      bins_per_octave: 72
+      fmin: C1
+      noise_filter: true
+      normalize_mode: global
+      peak_prominence: 0.015
+      use_torch: true
+      dtype: float32
+
+data:
+  train_config: configs/finetune.yaml
+  audio_root: ../MusicQA/audios
+  validation_fraction: 0.1
+  split_seed: 0
+  num_workers: 4
+  pin_memory: true
+
+training:
+  trainable_mode: ds_plus_lora
+  seed: 0
+  device: cuda
+  batch_size: 1
+  accum_iter: 32
+  epochs: 20
+  warmup_epochs: 1
+  min_lr: 0.0
+  weight_decay: 0.05
+  save_every: 1
+  resume: null
+  learning_rates:
+    ds_encoder: 3.0e-4
+    ds_fusion: 3.0e-4
+    llama_peft: 1.0e-4
+
+generation:
+  seed: 0
+  max_gen_len: 128
+  temperature: 0.1
+  top_p: 0.75
+  max_samples: null
+
+validation:
+  max_batches: null
+
+output:
+  root: outputs

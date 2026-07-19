@@ -1,0 +1,9 @@
+base: 01_ds_default.yaml
+experiment:
+  name: 04_ds_post_proj
+model:
+  dissonance:
+    fusion:
+      gate: scalar
+      position: post_proj
+
