@@ -14,11 +14,12 @@ fi
 
 PYTHON_BIN="${PYTHON_EXECUTABLE:-python}"
 if [[ "$TASK_KIND" == "train" ]]; then
-  "$PYTHON_BIN" train.py --config "${1:?experiment config path is required}"
+  CONFIG_PATH="${1:?experiment config path is required}"
+  shift
+  "$PYTHON_BIN" train.py --config "$CONFIG_PATH" "$@"
 elif [[ "$TASK_KIND" == "analyze" ]]; then
   "$PYTHON_BIN" scripts/analyze_results.py "$@"
 else
   echo "Unknown task kind: $TASK_KIND" >&2
   exit 2
 fi
-

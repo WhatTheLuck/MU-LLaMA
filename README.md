@@ -11,6 +11,18 @@
 
 This is the official repository for *[Music Understanding LLaMA: Advancing Text-to-Music Generation with Question Answering and Captioning](https://arxiv.org/abs/2308.11276)*
 
+## Dissonance Spectrum experiments
+
+The config-driven pipeline under `MU-LLaMA/` includes the original Stage 1 ablations (`00`–`08`) and the additive Stage 2 chain (`09`–`12`) for ordered temporal DS fusion, `post_bridge` fusion, and a shape-matched processed-CQT control. Stage 1 experiment meanings and paths are retained. The cluster entry point is:
+
+```bash
+cd MU-LLaMA
+python scripts/submit_sequence.py --group stage2_core --dry-run
+python scripts/submit_sequence.py --group stage2_core
+```
+
+See [`docs/ds_stage2_update.md`](./docs/ds_stage2_update.md) for the design, safeguards, experiment order, and verification commands. No performance values are claimed without real cluster runs.
+
 The demo page with more information regarding the MU-LLaMA model is avilable [here](https://crypto-code.github.io/MU-LLaMA-Demo/).
 
 ## Introduction

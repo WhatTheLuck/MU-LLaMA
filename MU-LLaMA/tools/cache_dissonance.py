@@ -73,10 +73,10 @@ def main() -> int:
                 "audio_id": audio_id,
                 "audio_path": str(audio_path),
                 "cache_path": str(saved),
-                "shape": list(payload["dissonance"].shape),
+                "shape": list(payload[adapter.tensor_key].shape),
                 "metadata": payload["metadata"],
             })
-            print(f"cached {audio_id}: {tuple(payload['dissonance'].shape)} -> {saved}")
+            print(f"cached {audio_id}: {tuple(payload[adapter.tensor_key].shape)} -> {saved}")
         except Exception as error:
             failed += 1
             _append_jsonl(failures_path, {
@@ -93,6 +93,7 @@ def main() -> int:
         "cached": processed,
         "skipped": skipped,
         "failed": failed,
+        "input_feature": adapter.input_feature,
     }, ensure_ascii=False, indent=2))
     return 0 if failed == 0 else 2
 

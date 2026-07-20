@@ -30,4 +30,19 @@ experiment_groups:
     - 07_ds_hop512
     - cache_08_ds_hop2048
     - 08_ds_hop2048
-
+  stage2_core:
+    - 00_baseline_peft
+    - 01_ds_default
+    - 09_ds_staged_global
+    - 10_ds_temporal_pre_proj
+    - 11_ds_temporal_post_bridge
+    - cache_12_cqt_temporal_post_bridge
+    - 12_cqt_temporal_post_bridge
+    - analyze_stage2
+  stage2_followup:
+    - 00_baseline_peft@3407
+    - 11_ds_temporal_post_bridge@3407
+    - 12_cqt_temporal_post_bridge@3407
+    - 00_baseline_peft@2026
+    - 11_ds_temporal_post_bridge@2026
+    - 12_cqt_temporal_post_bridge@2026

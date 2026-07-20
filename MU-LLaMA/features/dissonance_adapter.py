@@ -75,12 +75,20 @@ class DissonanceFeatureAdapter:
         self.config = dict(config or {})
         self.enabled = bool(self.config.get("enabled", False))
         self.parameters = _feature_parameters(self.config)
+        self.input_feature = self.config.get("input_feature", "dissonance_spectrum")
+        if self.input_feature not in {"dissonance_spectrum", "processed_cqt"}:
+            raise ValueError("input_feature must be dissonance_spectrum or processed_cqt")
         self.segment_seconds = self.config.get("segment_seconds", 60.0)
         self.segment_seconds = None if self.segment_seconds is None else float(self.segment_seconds)
-        self.config_hash = _config_hash({
+        hash_parameters = {
             "feature": self.parameters,
             "segment_seconds": self.segment_seconds,
-        })
+        }
+        # Keep Stage 1 DS cache hashes stable; only the new CQT control needs
+        # a distinct namespace because legacy payloads do not contain CQT.
+        if self.input_feature == "processed_cqt":
+            hash_parameters["input_feature"] = self.input_feature
+        self.config_hash = _config_hash(hash_parameters)
         cache_root = Path(self.config.get("cache_root", "cache/dissonance"))
         self.cache_dir = cache_root / self.config_hash
         self.require_cache = bool(self.config.get("require_cache", True))
@@ -88,6 +96,10 @@ class DissonanceFeatureAdapter:
     @property
     def frequency_bins(self) -> int:
         return int(self.parameters["n_octaves"]) * int(self.parameters["bins_per_octave"])
+
+    @property
+    def tensor_key(self) -> str:
+        return "processed_cqt" if self.input_feature == "processed_cqt" else "dissonance"
 
     def cache_path(self, audio_id: str, audio_path: str | Path) -> Path:
         resolved = Path(audio_path).resolve()
@@ -117,12 +129,26 @@ class DissonanceFeatureAdapter:
             if temporary_path is not None:
                 temporary_path.unlink(missing_ok=True)
         spectrum = np.asarray(details["dissonance_spectrum"], dtype=np.float32)
+        processed_cqt = np.asarray(details["processed_calc_cqt"], dtype=np.float32)
+        if processed_cqt.shape != spectrum.shape:
+            raise ValueError(
+                f"Processed CQT shape {processed_cqt.shape} does not match DS shape {spectrum.shape}"
+            )
         energy = module.calculate_dissonance_intensity(spectrum).astype(np.float32)
+        configured_fps = float(self.parameters.get("fps", 0.0))
+        configured_hop = int(self.parameters.get("hop_length", 1024))
         metadata = {
             "audio_id": str(audio_id),
             "audio_path": str(path),
             "sample_rate": int(details["sr"]),
             "hop_length": int(details["hop_length"]),
+            "configured_fps": configured_fps,
+            "effective_fps": float(details["fps"]),
+            "configured_hop_length": configured_hop,
+            "effective_hop_length": int(details["hop_length"]),
+            "frequency_bins": int(spectrum.shape[0]),
+            "time_frames": int(spectrum.shape[1]),
+            "input_feature": self.input_feature,
             "bins_per_octave": int(self.parameters["bins_per_octave"]),
             "n_octaves": int(self.parameters["n_octaves"]),
             "feature_version": FEATURE_VERSION,
@@ -133,15 +159,16 @@ class DissonanceFeatureAdapter:
         }
         return {
             "dissonance": torch.from_numpy(spectrum),
+            "processed_cqt": torch.from_numpy(processed_cqt),
             "energy": torch.from_numpy(energy),
             "metadata": metadata,
         }
 
     def validate(self, payload: Dict[str, Any]) -> None:
-        spectrum = payload.get("dissonance")
+        spectrum = payload.get(self.tensor_key)
         metadata = payload.get("metadata", {})
         if not torch.is_tensor(spectrum) or spectrum.ndim != 2:
-            raise ValueError("Cached dissonance must be a 2-D tensor")
+            raise ValueError(f"Cached {self.tensor_key} must be a 2-D tensor")
         if int(spectrum.shape[0]) != self.frequency_bins:
             raise ValueError(
                 f"Cache has {spectrum.shape[0]} frequency bins; expected {self.frequency_bins}"

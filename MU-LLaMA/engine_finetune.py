@@ -62,7 +62,8 @@ def train_one_epoch(model: LLaMA_adapter,
             dissonance_mask = dissonance_mask.to(device, non_blocking=True)
         if audio_lengths is not None:
             audio_lengths = audio_lengths.to(device, non_blocking=True)
-        with torch.cuda.amp.autocast(enabled=device.type == "cuda"):
+        autocast_dtype = torch.bfloat16 if getattr(args, "precision", "fp16") == "bf16" else torch.float16
+        with torch.cuda.amp.autocast(enabled=device.type == "cuda", dtype=autocast_dtype):
              c_loss, m_loss = model(
                  examples, labels, imgs, dissonance=dissonance,
                  dissonance_mask=dissonance_mask, audio_lengths=audio_lengths,
@@ -77,16 +78,22 @@ def train_one_epoch(model: LLaMA_adapter,
 
         loss /= accum_iter
         update_grad = (data_iter_step + 1) % accum_iter == 0
-        loss_scaler(loss, optimizer, parameters=(p for p in model.parameters() if p.requires_grad),
+        loss_scaler(loss, optimizer, clip_grad=getattr(args, "gradient_clip_norm", None),
+                    parameters=(p for p in model.parameters() if p.requires_grad),
                     update_grad=update_grad)
         if update_grad:
             base_model = model.module if hasattr(model, "module") else model
             if getattr(base_model, "ds_encoder", None) is not None:
                 metric_logger.update(ds_encoder_grad_norm=_grad_norm(base_model.ds_encoder.parameters()))
+                if getattr(base_model, "ds_temporal", None) is not None:
+                    metric_logger.update(ds_temporal_grad_norm=_grad_norm(base_model.ds_temporal.parameters()))
                 metric_logger.update(ds_fusion_grad_norm=_grad_norm(base_model.ds_fusion.parameters()))
             llama_peft = [parameter for name, parameter in base_model.named_parameters()
                           if name.startswith("llama.") and parameter.requires_grad]
             metric_logger.update(llama_peft_grad_norm=_grad_norm(llama_peft))
+            stage2_extra = [parameter for name, parameter in base_model.named_parameters()
+                            if parameter.requires_grad and name.startswith(("prefix_query.", "mu_mert_norm_"))]
+            metric_logger.update(stage2_extra_grad_norm=_grad_norm(stage2_extra))
             optimizer.zero_grad()
 
         if device.type == "cuda":

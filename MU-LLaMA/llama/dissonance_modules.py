@@ -1,7 +1,8 @@
-"""Lightweight Dissonance Spectrum encoders and gated residual fusion."""
+"""Lightweight global/temporal Dissonance Spectrum encoders and fusion."""
 
 from __future__ import annotations
 
+import math
 from typing import Dict, Optional, Tuple
 
 import torch
@@ -34,14 +35,20 @@ class CNNSmallEncoder(nn.Module):
             nn.Linear(hidden_dim, embedding_dim),
         )
 
-    def forward(self, spectrum: torch.Tensor, time_mask: torch.Tensor) -> torch.Tensor:
-        features = self.network(spectrum.unsqueeze(1))
+    def extract_feature_map(self, spectrum: torch.Tensor) -> torch.Tensor:
+        """Return the ordered CNN map without changing the legacy forward path."""
+        return self.network(spectrum.unsqueeze(1))
+
+    def pool_feature_map(self, features: torch.Tensor, time_mask: torch.Tensor) -> torch.Tensor:
         resized_mask = F.interpolate(
             time_mask[:, None, :].to(features.dtype), size=features.shape[-1], mode="nearest"
         ).squeeze(1)
         pooled_frequency = features.mean(dim=2)
         pooled = _masked_mean(pooled_frequency, resized_mask[:, None, :], dim=-1)
         return self.output(pooled)
+
+    def forward(self, spectrum: torch.Tensor, time_mask: torch.Tensor) -> torch.Tensor:
+        return self.pool_feature_map(self.extract_feature_map(spectrum), time_mask)
 
 
 class MLPPoolEncoder(nn.Module):
@@ -98,6 +105,82 @@ def build_ds_encoder(config: Dict, frequency_bins: int) -> nn.Module:
     raise ValueError(f"Unknown DS encoder type: {encoder_type}")
 
 
+def sinusoidal_positions(length: int, dimension: int, device, dtype) -> torch.Tensor:
+    """Parameter-free sinusoidal positions in chronological order."""
+    positions = torch.arange(length, device=device, dtype=torch.float32).unsqueeze(1)
+    scales = torch.exp(
+        torch.arange(0, dimension, 2, device=device, dtype=torch.float32)
+        * (-math.log(10000.0) / max(1, dimension))
+    )
+    encoding = torch.zeros(length, dimension, device=device, dtype=torch.float32)
+    encoding[:, 0::2] = torch.sin(positions * scales)
+    if dimension > 1:
+        encoding[:, 1::2] = torch.cos(positions * scales[: encoding[:, 1::2].shape[1]])
+    return encoding.to(dtype=dtype)
+
+
+class DSTemporalEncoder(nn.Module):
+    """Turn the CNN feature map into masked, ordered DS tokens."""
+
+    def __init__(
+        self,
+        input_dim: int = 128,
+        token_dim: int = 256,
+        conv_kernel: int = 5,
+        dropout: float = 0.1,
+        positional_encoding: str = "sinusoidal",
+    ):
+        super().__init__()
+        if conv_kernel < 1 or conv_kernel % 2 == 0:
+            raise ValueError("temporal.conv_kernel must be a positive odd integer")
+        if positional_encoding not in {"sinusoidal", "none"}:
+            raise ValueError("temporal.positional_encoding must be sinusoidal or none")
+        self.token_dim = int(token_dim)
+        self.positional_encoding = positional_encoding
+        self.input_projection = nn.Linear(int(input_dim), self.token_dim)
+        self.depthwise = nn.Conv1d(
+            self.token_dim, self.token_dim, int(conv_kernel),
+            padding=int(conv_kernel) // 2, groups=self.token_dim,
+        )
+        self.pointwise = nn.Conv1d(self.token_dim, self.token_dim, 1)
+        self.dropout = nn.Dropout(float(dropout))
+        self.norm = nn.LayerNorm(self.token_dim)
+
+    def forward(
+        self, feature_map: torch.Tensor, time_mask: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if feature_map.ndim != 4:
+            raise ValueError("DS temporal input must have shape [B,C,F,T]")
+        resized_mask = F.interpolate(
+            time_mask[:, None, :].to(feature_map.dtype),
+            size=feature_map.shape[-1], mode="nearest",
+        ).squeeze(1).bool()
+        # Frequency is summarized, but time is deliberately retained and ordered.
+        tokens = feature_map.mean(dim=2).transpose(1, 2)
+        tokens = self.input_projection(tokens)
+        tokens = tokens * resized_mask.unsqueeze(-1).to(tokens.dtype)
+        if self.positional_encoding == "sinusoidal":
+            tokens = tokens + sinusoidal_positions(
+                tokens.shape[1], tokens.shape[2], tokens.device, tokens.dtype
+            ).unsqueeze(0) * resized_mask.unsqueeze(-1).to(tokens.dtype)
+        convolution = self.pointwise(self.depthwise(tokens.transpose(1, 2))).transpose(1, 2)
+        tokens = self.norm(tokens + self.dropout(F.gelu(convolution)))
+        tokens = tokens * resized_mask.unsqueeze(-1).to(tokens.dtype)
+        return tokens, resized_mask
+
+
+def build_ds_temporal_encoder(config: Dict, input_dim: int = 128) -> Optional[DSTemporalEncoder]:
+    if not bool(config.get("enabled", False)):
+        return None
+    return DSTemporalEncoder(
+        input_dim=input_dim,
+        token_dim=int(config.get("token_dim", 256)),
+        conv_kernel=int(config.get("conv_kernel", 5)),
+        dropout=float(config.get("dropout", 0.1)),
+        positional_encoding=config.get("positional_encoding", "sinusoidal"),
+    )
+
+
 class GatedResidualFusion(nn.Module):
     """Low-rank projection and scalar/channel gate, bounded below 5M params."""
 
@@ -140,6 +223,83 @@ class GatedResidualFusion(nn.Module):
             "gate_mean": gate.detach().float().mean(),
             "gate_std": gate.detach().float().std(unbiased=False),
             "ds_embedding_norm": ds_embedding.detach().float().norm(dim=-1).mean(),
+            "mert_embedding_norm": base.detach().float().norm(dim=-1).mean(),
+            "fused_embedding_norm": fused.detach().float().norm(dim=-1).mean(),
+            "ds_residual_ratio": (
+                residual.detach().float().norm(dim=-1)
+                / base.detach().float().norm(dim=-1).clamp_min(float(eps))
+            ).mean(),
+        }
+        return fused, stats
+
+
+class TemporalGatedAttentionFusion(nn.Module):
+    """Single-query masked attention followed by a zero-init gated residual."""
+
+    def __init__(
+        self,
+        base_dim: int,
+        token_dim: int = 256,
+        attention_dim: int = 256,
+        num_heads: int = 1,
+        gate: str = "scalar",
+        gate_bias_init: float = -3.0,
+        output_zero_init: bool = True,
+        hidden_dim: int = 256,
+    ):
+        super().__init__()
+        if int(num_heads) != 1:
+            raise ValueError("Stage 2 temporal fusion currently requires num_heads=1")
+        if gate != "scalar":
+            raise ValueError("Stage 2 temporal fusion requires a scalar gate")
+        self.attention_dim = int(attention_dim)
+        self.query = nn.Linear(int(base_dim), self.attention_dim, bias=False)
+        self.key = nn.Linear(int(token_dim), self.attention_dim, bias=False)
+        self.value = nn.Linear(int(token_dim), self.attention_dim, bias=False)
+        self.context_projection = nn.Linear(self.attention_dim, int(base_dim))
+        self.gate_layer = nn.Sequential(
+            nn.Linear(int(base_dim) * 2, int(hidden_dim)),
+            nn.SiLU(),
+            nn.Linear(int(hidden_dim), 1),
+        )
+        nn.init.constant_(self.gate_layer[-1].bias, float(gate_bias_init))
+        if output_zero_init:
+            nn.init.zeros_(self.context_projection.weight)
+            nn.init.zeros_(self.context_projection.bias)
+
+    def forward(
+        self,
+        base: torch.Tensor,
+        temporal_tokens: torch.Tensor,
+        temporal_mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        if base.ndim != 2 or temporal_tokens.ndim != 3 or temporal_mask.ndim != 2:
+            raise ValueError("temporal fusion expects base [B,D], tokens [B,T,D], mask [B,T]")
+        valid = temporal_mask.any(dim=-1)
+        safe_mask = temporal_mask.bool().clone()
+        if safe_mask.shape[1] == 0:
+            raise ValueError("temporal fusion requires at least one padded token slot")
+        safe_mask[~valid, 0] = True
+        query = self.query(base).unsqueeze(1)
+        key = self.key(temporal_tokens)
+        value = self.value(temporal_tokens)
+        scores = torch.matmul(query, key.transpose(1, 2)) / math.sqrt(self.attention_dim)
+        scores = scores.masked_fill(~safe_mask[:, None, :], float("-inf"))
+        attention = torch.softmax(scores.float(), dim=-1).to(value.dtype)
+        context = torch.matmul(attention, value).squeeze(1)
+        projected = self.context_projection(context)
+        gate = torch.sigmoid(self.gate_layer(torch.cat((base, projected), dim=-1)))
+        residual = gate * projected * valid.to(base.dtype).unsqueeze(1)
+        fused = base + residual
+        entropy = -(attention.float().clamp_min(1e-12).log() * attention.float()).sum(dim=-1)
+        eps = torch.finfo(base.dtype).eps if base.dtype.is_floating_point else 1e-8
+        stats = {
+            "attention_entropy": (
+                entropy[valid].mean().detach() if valid.any() else entropy.new_zeros(())
+            ),
+            "gate_mean": gate.detach().float().mean(),
+            "gate_std": gate.detach().float().std(unbiased=False),
+            "ds_embedding_norm": context.detach().float().norm(dim=-1).mean(),
             "mert_embedding_norm": base.detach().float().norm(dim=-1).mean(),
             "fused_embedding_norm": fused.detach().float().norm(dim=-1).mean(),
             "ds_residual_ratio": (

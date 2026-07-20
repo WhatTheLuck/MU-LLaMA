@@ -126,9 +126,12 @@ class FinetuneDataset(Dataset):
         ds_payload = None
         if self.dissonance is not None and has_audio:
             ds_payload = self.dissonance.load(audio_id, filename)
+            ds_payload = dict(ds_payload)
+            ds_payload["model_input"] = ds_payload[self.dissonance.tensor_key]
         elif self.dissonance is not None:
             ds_payload = {
                 "dissonance": torch.zeros(self.dissonance.frequency_bins, 1),
+                "model_input": torch.zeros(self.dissonance.frequency_bins, 1),
                 "energy": None,
                 "metadata": {"valid": False},
             }
@@ -159,9 +162,9 @@ def finetune_collate(batch):
     ds_mask = None
     if any(payload is not None for payload in ds_payloads):
         first = next(payload for payload in ds_payloads if payload is not None)
-        frequency_bins = int(first["dissonance"].shape[0])
+        frequency_bins = int(first["model_input"].shape[0])
         max_frames = max(
-            int(payload["dissonance"].shape[1]) if payload is not None else 1
+            int(payload["model_input"].shape[1]) if payload is not None else 1
             for payload in ds_payloads
         )
         ds_batch = torch.zeros(len(batch), frequency_bins, max_frames, dtype=torch.float32)
@@ -169,7 +172,7 @@ def finetune_collate(batch):
         for index, payload in enumerate(ds_payloads):
             if payload is None or payload.get("metadata", {}).get("valid") is False:
                 continue
-            spectrum = payload["dissonance"].float()
+            spectrum = payload["model_input"].float()
             if spectrum.shape[0] != frequency_bins:
                 raise ValueError("All DS features in a batch must use the same frequency bins")
             ds_batch[index, :, :spectrum.shape[1]] = spectrum

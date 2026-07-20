@@ -1,0 +1,6 @@
+base: 11_ds_temporal_post_bridge.yaml
+experiment:
+  name: 12_cqt_temporal_post_bridge
+model:
+  dissonance:
+    input_feature: processed_cqt

@@ -1,0 +1,36 @@
+base: 01_ds_default.yaml
+experiment:
+  name: 09_ds_staged_global
+model:
+  dissonance:
+    input_feature: dissonance_spectrum
+    temporal:
+      enabled: false
+    fusion:
+      type: gated_residual
+      gate: scalar
+      position: pre_proj
+training:
+  trainable_mode: ds_stage2_minimal
+  seed: 42
+  batch_size: 1
+  accum_iter: 32
+  epochs: 10
+  stage1_epochs: 2
+  stage2_epochs: 8
+  precision: bf16
+  gradient_clip_norm: 1.0
+  weight_decay: 0.01
+  warmup_epochs: null
+  warmup_ratio: 0.1
+  min_lr: 0.0
+  early_stopping:
+    patience: 2
+  learning_rates:
+    ds_encoder: 1.0e-4
+    ds_temporal: 1.0e-4
+    ds_fusion: 1.0e-4
+    prefix_query: 2.0e-5
+    bridge_norm: 2.0e-5
+generation:
+  seed: 42

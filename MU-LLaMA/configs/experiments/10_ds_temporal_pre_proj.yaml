@@ -1,0 +1,20 @@
+base: 09_ds_staged_global.yaml
+experiment:
+  name: 10_ds_temporal_pre_proj
+model:
+  dissonance:
+    temporal:
+      enabled: true
+      token_dim: 256
+      conv_kernel: 5
+      dropout: 0.1
+      positional_encoding: sinusoidal
+    fusion:
+      type: temporal_gated_attention
+      position: pre_proj
+      attention_dim: 256
+      num_heads: 1
+      gate: scalar
+      gate_bias_init: -3.0
+      output_zero_init: true
+      hidden_dim: 256

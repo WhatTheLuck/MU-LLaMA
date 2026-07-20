@@ -10,6 +10,24 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
+import yaml
+
+
+STAGE2_EXPERIMENTS = [
+    "01_ds_default", "09_ds_staged_global", "10_ds_temporal_pre_proj",
+    "11_ds_temporal_post_bridge", "12_cqt_temporal_post_bridge",
+]
+STAGE2_COMPARISONS = [
+    ("00_baseline_peft", "01_ds_default"),
+    ("01_ds_default", "09_ds_staged_global"),
+    ("09_ds_staged_global", "10_ds_temporal_pre_proj"),
+    ("10_ds_temporal_pre_proj", "11_ds_temporal_post_bridge"),
+    ("11_ds_temporal_post_bridge", "12_cqt_temporal_post_bridge"),
+]
+HARMONY_KEYWORDS = (
+    "harmony", "harmonic", "chord", "tonal", "tonality", "key", "mode",
+    "dissonance", "consonance", "cadence", "interval", "pitch",
+)
 
 
 def read_json(path: Path) -> dict:
@@ -22,16 +40,49 @@ def read_jsonl(path: Path) -> List[dict]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
-def latest_run(root: Path, experiment: str) -> Optional[Path]:
+def latest_run(root: Path, experiment: str, seed: Optional[int] = None) -> Optional[Path]:
     candidates = []
-    for seed_dir in (root / experiment).glob("seed_*"):
-        candidates.extend(path for path in seed_dir.iterdir() if path.is_dir())
+    seed_dirs = [(root / experiment / f"seed_{seed}")] if seed is not None else (root / experiment).glob("seed_*")
+    for seed_dir in seed_dirs:
+        if not seed_dir.is_dir():
+            continue
+        candidates.extend(path for path in seed_dir.glob("run_*") if path.is_dir())
     valid = [path for path in candidates if (path / "metrics.jsonl").is_file()]
     return max(valid, key=lambda path: path.stat().st_mtime) if valid else None
 
 
 def prediction_key(record: dict) -> Tuple[str, str]:
     return str(record.get("audio_id")), str(record.get("question_id"))
+
+
+def question_group(record: dict) -> str:
+    question_type = str(record.get("question_type") or "").strip().lower()
+    if question_type and question_type not in {"unknown", "none", "null"}:
+        return "harmony" if any(word in question_type for word in HARMONY_KEYWORDS) else "other"
+    question = str(record.get("question") or "").lower()
+    return "harmony" if any(word in question for word in HARMONY_KEYWORDS) else "other"
+
+
+def mean_metric(records: List[dict], key: str):
+    values = [float(record[key]) for record in records if isinstance(record.get(key), (int, float))]
+    return float(np.mean(values)) if values else None
+
+
+def subgroup_metrics(records: List[dict], group: str) -> dict:
+    selected = records if group == "overall" else [r for r in records if question_group(r) == group]
+    return {
+        "samples": len(selected),
+        "BLEU": mean_metric(selected, "bleu"),
+        "METEOR": mean_metric(selected, "meteor"),
+        "ROUGE-L": mean_metric(selected, "rouge_l"),
+        "BERTScore": mean_metric(selected, "bertscore_f1"),
+        "val_loss": mean_metric(selected, "sample_loss"),
+    }
+
+
+def resolved_config(run: Path) -> dict:
+    path = run / "config_resolved.yaml"
+    return yaml.safe_load(path.read_text(encoding="utf-8")) if path.is_file() else {}
 
 
 def paired_metric(baseline: List[dict], experiment: List[dict]) -> Tuple[Optional[str], np.ndarray, List[dict]]:
@@ -73,7 +124,13 @@ def paired_statistics(differences: np.ndarray, bootstrap_samples: int, seed: int
 
 
 def write_summary(rows: List[dict], root: Path) -> None:
-    keys = sorted({key for row in rows for key in row})
+    preferred = [
+        "experiment", "group", "feature_type", "temporal_enabled", "fusion_type", "position",
+        "trainable_parameters", "best_epoch", "val_loss", "BLEU", "METEOR", "ROUGE-L",
+        "BERTScore", "runtime", "peak_GPU", "samples", "run",
+    ]
+    available = {key for row in rows for key in row}
+    keys = [key for key in preferred if key in available] + sorted(available - set(preferred))
     with (root / "summary.csv").open("w", encoding="utf-8-sig", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=keys)
         writer.writeheader()
@@ -191,18 +248,24 @@ def make_figures(root: Path, baseline: str, experiments: List[str], runs: Dict[s
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=Path("outputs"))
-    parser.add_argument("--baseline", required=True)
-    parser.add_argument("--experiments", nargs="+", required=True)
+    parser.add_argument("--baseline")
+    parser.add_argument("--experiments", nargs="+")
+    parser.add_argument("--stage2", action="store_true")
     parser.add_argument("--bootstrap-samples", type=int, default=2000)
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
+    if args.stage2:
+        args.baseline = "00_baseline_peft"
+        args.experiments = STAGE2_EXPERIMENTS
+    if not args.baseline or not args.experiments:
+        parser.error("--baseline and --experiments are required unless --stage2 is used")
     args.root.mkdir(parents=True, exist_ok=True)
 
     runs = {}
     rows = []
     names = [args.baseline, *args.experiments]
     for index, name in enumerate(names):
-        run = latest_run(args.root, name)
+        run = latest_run(args.root, name, seed=42 if args.stage2 else None)
         if run is None:
             print(f"skip {name}: no completed run found")
             continue
@@ -210,31 +273,91 @@ def main() -> int:
         predictions = read_jsonl(run / "predictions.jsonl")
         evaluation = read_json(run / "evaluation.json")
         parameters = read_json(run / "parameter_summary.json")
+        environment = read_json(run / "environment.txt")
+        config = resolved_config(run)
         runs[name] = {"path": run, "metrics": metrics, "predictions": predictions, "evaluation": evaluation}
-        row = {
+        ds = config.get("model", {}).get("dissonance", {})
+        temporal = ds.get("temporal", {})
+        fusion = ds.get("fusion", {})
+        enabled = bool(ds.get("enabled", False))
+        best_epoch = evaluation.get("best_epoch")
+        if best_epoch is None and metrics:
+            best_epoch = min(metrics, key=lambda item: item.get("val_loss", float("inf"))).get("epoch")
+        common = {
             "experiment": name,
             "run": str(run),
-            "total_parameters": parameters.get("total_parameters"),
+            "feature_type": ds.get("input_feature", "dissonance_spectrum") if enabled else "none",
+            "temporal_enabled": bool(temporal.get("enabled", False)),
+            "fusion_type": fusion.get("type", "gated_residual") if enabled else "none",
+            "position": fusion.get("position", "none") if enabled else "none",
             "trainable_parameters": parameters.get("trainable_parameters"),
-            **{key: value for key, value in evaluation.items() if isinstance(value, (int, float))},
+            "best_epoch": best_epoch,
+            "runtime": environment.get("training_duration_seconds"),
+            "peak_GPU": environment.get("peak_gpu_memory_mb"),
         }
-        if metrics:
-            row.update({f"final_{key}": value for key, value in metrics[-1].items()
-                        if isinstance(value, (int, float))})
-        if name != args.baseline and args.baseline in runs:
-            metric, differences, _ = paired_metric(runs[args.baseline]["predictions"], predictions)
-            row["paired_metric"] = metric
-            row.update(paired_statistics(differences, args.bootstrap_samples, args.seed + index))
-        rows.append(row)
+        for group in ("overall", "harmony", "other"):
+            aggregate = subgroup_metrics(predictions, group)
+            if group == "overall":
+                aggregate.update({
+                    "BLEU": evaluation.get("bleu", aggregate["BLEU"]),
+                    "METEOR": evaluation.get("meteor", aggregate["METEOR"]),
+                    "ROUGE-L": evaluation.get("rouge_l", aggregate["ROUGE-L"]),
+                    "BERTScore": evaluation.get("bertscore_f1", aggregate["BERTScore"]),
+                    "val_loss": evaluation.get("val_loss", aggregate["val_loss"]),
+                })
+            rows.append({**common, "group": group, **aggregate})
 
     if not rows:
         raise RuntimeError("No real experiment outputs were found; analysis will not fabricate data")
+    if args.stage2:
+        missing = [name for name in names if name not in runs]
+        if missing:
+            raise RuntimeError(f"Stage 2 analysis requires all round-1 runs; missing: {missing}")
     write_summary(rows, args.root)
     make_figures(args.root, args.baseline, args.experiments, runs)
+    if args.stage2:
+        comparison_rows = []
+        for comparison_index, (left, right) in enumerate(STAGE2_COMPARISONS):
+            if left not in runs or right not in runs:
+                continue
+            for group in ("overall", "harmony", "other"):
+                left_records = runs[left]["predictions"]
+                right_records = runs[right]["predictions"]
+                if group != "overall":
+                    left_records = [record for record in left_records if question_group(record) == group]
+                    right_records = [record for record in right_records if question_group(record) == group]
+                metric, differences, _ = paired_metric(left_records, right_records)
+                comparison_rows.append({
+                    "comparison": f"{left} vs {right}",
+                    "group": group,
+                    "paired_metric": metric,
+                    **paired_statistics(differences, args.bootstrap_samples, args.seed + comparison_index),
+                })
+        with (args.root / "stage2_comparisons.json").open("w", encoding="utf-8") as handle:
+            json.dump(comparison_rows, handle, ensure_ascii=False, indent=2)
+        recommended = runs.get("11_ds_temporal_post_bridge", {}).get("evaluation", {})
+        controls = [runs.get(name, {}).get("evaluation", {}) for name in (
+            "00_baseline_peft", "01_ds_default", "12_cqt_temporal_post_bridge"
+        )]
+        def score(item):
+            for key in ("bertscore_f1", "rouge_l", "meteor", "bleu"):
+                value = item.get(key)
+                if isinstance(value, (int, float)):
+                    return float(value)
+            return -float("inf")
+        eligible = bool(recommended) and all(control and score(recommended) > score(control) for control in controls)
+        (args.root / "stage2_followup.json").write_text(json.dumps({
+            "eligible": eligible,
+            "rule": "11 must outperform 00, 01, and 12 before running seeds 3407 and 2026",
+            "experiments": ["00_baseline_peft", "11_ds_temporal_post_bridge", "12_cqt_temporal_post_bridge"],
+            "seeds": [3407, 2026],
+        }, ensure_ascii=False, indent=2), encoding="utf-8")
+        (args.root / "stage2_analysis_complete.json").write_text(json.dumps({
+            "status": "completed", "experiments": [args.baseline, *args.experiments]
+        }, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"wrote {args.root / 'summary.csv'}, {args.root / 'summary.md'}, and {args.root / 'figures'}")
     return 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

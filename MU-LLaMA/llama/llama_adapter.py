@@ -9,7 +9,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .llama import Transformer, ModelArgs, RMSNorm
-from .dissonance_modules import GatedResidualFusion, build_ds_encoder
+from .dissonance_modules import (
+    GatedResidualFusion,
+    TemporalGatedAttentionFusion,
+    build_ds_encoder,
+    build_ds_temporal_encoder,
+)
 from .tokenizer import Tokenizer
 from util.misc import download
 from .utils import sample_top_p
@@ -40,6 +45,7 @@ class LLaMA_adapter(nn.Module):
         self.dissonance_config = dict(dissonance_config or {})
         self.dissonance_enabled = bool(self.dissonance_config.get("enabled", False))
         self.ds_encoder = None
+        self.ds_temporal = None
         self.ds_fusion = None
         self.ds_fusion_position = None
         self.last_dissonance_stats = {}
@@ -51,17 +57,40 @@ class LLaMA_adapter(nn.Module):
                 feature_config.get("bins_per_octave", 72)
             )
             embedding_dim = int(encoder_config.get("embedding_dim", 1024))
+            temporal_config = self.dissonance_config.get("temporal", {})
             self.ds_fusion_position = fusion_config.get("position", "pre_proj")
-            if self.ds_fusion_position not in {"pre_proj", "post_proj"}:
-                raise ValueError("fusion.position must be 'pre_proj' or 'post_proj'")
+            if self.ds_fusion_position not in {"pre_proj", "post_proj", "post_bridge"}:
+                raise ValueError("fusion.position must be pre_proj, post_proj, or post_bridge")
             self.ds_encoder = build_ds_encoder(encoder_config, frequency_bins)
-            self.ds_fusion = GatedResidualFusion(
-                base_dim=1024 if self.ds_fusion_position == "pre_proj" else 4096,
-                ds_dim=embedding_dim,
-                hidden_dim=int(fusion_config.get("hidden_dim", encoder_config.get("hidden_dim", 256))),
-                gate=fusion_config.get("gate", "scalar"),
-                gate_bias_init=float(fusion_config.get("gate_bias_init", -2.0)),
-            )
+            temporal_enabled = bool(temporal_config.get("enabled", False))
+            if temporal_enabled and not hasattr(self.ds_encoder, "extract_feature_map"):
+                raise ValueError("Temporal DS currently requires encoder.type=cnn_small")
+            self.ds_temporal = build_ds_temporal_encoder(temporal_config, input_dim=128)
+            base_dim = 1024 if self.ds_fusion_position == "pre_proj" else 4096
+            fusion_type = fusion_config.get("type", "gated_residual")
+            if fusion_type == "gated_residual":
+                self.ds_fusion = GatedResidualFusion(
+                    base_dim=base_dim,
+                    ds_dim=embedding_dim,
+                    hidden_dim=int(fusion_config.get("hidden_dim", encoder_config.get("hidden_dim", 256))),
+                    gate=fusion_config.get("gate", "scalar"),
+                    gate_bias_init=float(fusion_config.get("gate_bias_init", -2.0)),
+                )
+            elif fusion_type == "temporal_gated_attention":
+                if not temporal_enabled:
+                    raise ValueError("temporal_gated_attention requires temporal.enabled=true")
+                self.ds_fusion = TemporalGatedAttentionFusion(
+                    base_dim=base_dim,
+                    token_dim=int(temporal_config.get("token_dim", 256)),
+                    attention_dim=int(fusion_config.get("attention_dim", 256)),
+                    num_heads=int(fusion_config.get("num_heads", 1)),
+                    gate=fusion_config.get("gate", "scalar"),
+                    gate_bias_init=float(fusion_config.get("gate_bias_init", -3.0)),
+                    output_zero_init=bool(fusion_config.get("output_zero_init", True)),
+                    hidden_dim=int(fusion_config.get("hidden_dim", 256)),
+                )
+            else:
+                raise ValueError(f"Unknown fusion.type: {fusion_type}")
 
         if legacy_bridge:
             bridge_norm_layer = nn.LayerNorm
@@ -176,15 +205,16 @@ class LLaMA_adapter(nn.Module):
 
         self.phase = phase
         self.trainable_mode = trainable_mode or ("baseline_peft" if phase == "finetune" else phase)
+        self.training_stage = 1
         self.set_default_trainability(self.phase, self.trainable_mode)
 
-    def get_trainable_params(self, phase='finetune', trainable_mode=None):
+    def get_trainable_params(self, phase='finetune', trainable_mode=None, training_stage=None):
         trainable = {}
         if phase == 'finetune':
             mode = trainable_mode or self.trainable_mode
-            if mode not in {"ds_only", "ds_plus_lora", "baseline_peft"}:
+            if mode not in {"ds_only", "ds_plus_lora", "baseline_peft", "ds_stage2_minimal"}:
                 raise ValueError(f"Unknown trainable mode: {mode}")
-            if mode in {"ds_only", "ds_plus_lora"} and not self.dissonance_enabled:
+            if mode in {"ds_only", "ds_plus_lora", "ds_stage2_minimal"} and not self.dissonance_enabled:
                 raise ValueError(f"{mode} requires model.dissonance.enabled=true")
             if mode == "baseline_peft" and self.dissonance_enabled:
                 raise ValueError("baseline_peft requires model.dissonance.enabled=false")
@@ -192,8 +222,15 @@ class LLaMA_adapter(nn.Module):
                 if mode in {"baseline_peft", "ds_plus_lora"} and name.startswith("llama."):
                     if 'norm' in name or 'bias' in name or 'lora' in name:
                         trainable[name] = para
-                if mode in {"ds_only", "ds_plus_lora"} and name.startswith(("ds_encoder.", "ds_fusion.")):
+                if mode in {"ds_only", "ds_plus_lora", "ds_stage2_minimal"} and name.startswith(
+                    ("ds_encoder.", "ds_temporal.", "ds_fusion.")
+                ):
                     trainable[name] = para
+                if mode == "ds_stage2_minimal" and int(training_stage or self.training_stage) >= 2:
+                    if name.startswith("prefix_query.") or name.startswith((
+                        "mu_mert_norm_1.", "mu_mert_norm_2.", "mu_mert_norm_3.",
+                    )):
+                        trainable[name] = para
         elif phase == 'pretrain':
             for name, para in self.named_parameters():
                 if name.startswith("llama."):
@@ -207,12 +244,37 @@ class LLaMA_adapter(nn.Module):
             raise ValueError(f"Unknown model phase: {phase}")
         return trainable
 
-    def set_default_trainability(self, phase='finetune', trainable_mode=None):
+    def set_default_trainability(self, phase='finetune', trainable_mode=None, training_stage=None):
+        if training_stage is not None:
+            self.training_stage = int(training_stage)
         for key, value in self.named_parameters():
             value.requires_grad = False
-        for key, value in self.get_trainable_params(phase, trainable_mode).items():
+        for key, value in self.get_trainable_params(phase, trainable_mode, training_stage).items():
             value.data = value.data.float()
             value.requires_grad = True
+
+    def set_stage2_training_stage(self, stage: int) -> None:
+        if self.trainable_mode != "ds_stage2_minimal":
+            raise ValueError("Training stages are only defined for ds_stage2_minimal")
+        if int(stage) not in {1, 2}:
+            raise ValueError("Stage must be 1 or 2")
+        self.set_default_trainability(self.phase, self.trainable_mode, int(stage))
+
+    def encode_dissonance(self, spectrum, time_mask):
+        """Return the Stage 2 DS contract while preserving legacy global computation."""
+        spectrum = spectrum * time_mask[:, None, :].to(spectrum.dtype)
+        temporal_tokens = temporal_mask = None
+        if self.ds_temporal is not None:
+            feature_map = self.ds_encoder.extract_feature_map(spectrum)
+            global_embedding = self.ds_encoder.pool_feature_map(feature_map, time_mask)
+            temporal_tokens, temporal_mask = self.ds_temporal(feature_map, time_mask)
+        else:
+            global_embedding = self.ds_encoder(spectrum, time_mask)
+        return {
+            "global_embedding": global_embedding,
+            "temporal_tokens": temporal_tokens,
+            "temporal_mask": temporal_mask,
+        }
 
     def load_audio(self, audio_path, target_sr=16000):
         y, sr = torchaudio.load(audio_path)
@@ -275,24 +337,32 @@ class LLaMA_adapter(nn.Module):
             audio_feats = audio_feats / audio_feats.norm(dim=-1, keepdim=True)
 
         self.last_dissonance_stats = {}
-        ds_embedding = None
+        ds_output = None
         ds_valid = None
         if self.dissonance_enabled:
             if dissonance is None or dissonance_mask is None:
                 raise ValueError("Dissonance Spectrum tensors are required when DS is enabled")
-            ds_embedding = self.ds_encoder(dissonance, dissonance_mask)
+            ds_output = self.encode_dissonance(dissonance, dissonance_mask)
             ds_valid = dissonance_mask.any(dim=-1)
             if self.ds_fusion_position == "pre_proj":
-                audio_feats, self.last_dissonance_stats = self.ds_fusion(
-                    audio_feats, ds_embedding, ds_valid
-                )
+                if ds_output["temporal_tokens"] is None:
+                    audio_feats, self.last_dissonance_stats = self.ds_fusion(
+                        audio_feats, ds_output["global_embedding"], ds_valid
+                    )
+                else:
+                    audio_feats, self.last_dissonance_stats = self.ds_fusion(
+                        audio_feats, ds_output["temporal_tokens"], ds_output["temporal_mask"]
+                    )
 
         audio_feats = audio_feats.unsqueeze(1)  # B, 1, D
         audio_feats = self.mu_mert_proj(audio_feats)
         if self.dissonance_enabled and self.ds_fusion_position == "post_proj":
-            fused, self.last_dissonance_stats = self.ds_fusion(
-                audio_feats.squeeze(1), ds_embedding, ds_valid
+            fusion_input = (
+                (ds_output["global_embedding"], ds_valid)
+                if ds_output["temporal_tokens"] is None
+                else (ds_output["temporal_tokens"], ds_output["temporal_mask"])
             )
+            fused, self.last_dissonance_stats = self.ds_fusion(audio_feats.squeeze(1), *fusion_input)
             audio_feats = fused.unsqueeze(1)
         audio_feats_norm = self.mu_mert_norm_1(audio_feats)
         audio_feats = audio_feats + self.mu_mert_f2_1(
@@ -305,6 +375,14 @@ class LLaMA_adapter(nn.Module):
         audio_feats_norm = self.mu_mert_norm_3(audio_feats)
         audio_feats = audio_feats + self.mu_mert_f2_3(
             F.silu(self.mu_mert_f1_3(audio_feats_norm)) * self.mu_mert_f3_3(audio_feats_norm))
+        if self.dissonance_enabled and self.ds_fusion_position == "post_bridge":
+            fusion_input = (
+                (ds_output["global_embedding"], ds_valid)
+                if ds_output["temporal_tokens"] is None
+                else (ds_output["temporal_tokens"], ds_output["temporal_mask"])
+            )
+            fused, self.last_dissonance_stats = self.ds_fusion(audio_feats.squeeze(1), *fusion_input)
+            audio_feats = fused.unsqueeze(1)
         return audio_feats
 
     @torch.inference_mode()

@@ -111,10 +111,14 @@ def parameter_groups(model: torch.nn.Module, config: Dict[str, Any]) -> Tuple[Li
     learning_rates = config.get("training", {}).get("learning_rates", {})
     group_lrs = {
         "ds_encoder": float(learning_rates.get("ds_encoder", 3e-4)),
+        "ds_temporal": float(learning_rates.get("ds_temporal", learning_rates.get("ds_encoder", 3e-4))),
         "ds_fusion": float(learning_rates.get("ds_fusion", 3e-4)),
+        "prefix_query": float(learning_rates.get("prefix_query", 2e-5)),
+        "bridge_norm": float(learning_rates.get("bridge_norm", 2e-5)),
         "llama_peft": float(learning_rates.get("llama_peft", 1e-4)),
     }
     weight_decay = float(config.get("training", {}).get("weight_decay", 0.05))
+    stage2_no_decay = config.get("training", {}).get("trainable_mode") == "ds_stage2_minimal"
     grouped: Dict[str, List[Tuple[str, torch.nn.Parameter]]] = {key: [] for key in group_lrs}
     unexpected = []
     for name, parameter in model.named_parameters():
@@ -122,8 +126,14 @@ def parameter_groups(model: torch.nn.Module, config: Dict[str, Any]) -> Tuple[Li
             continue
         if name.startswith("ds_encoder."):
             grouped["ds_encoder"].append((name, parameter))
+        elif name.startswith("ds_temporal."):
+            grouped["ds_temporal"].append((name, parameter))
         elif name.startswith("ds_fusion."):
             grouped["ds_fusion"].append((name, parameter))
+        elif name.startswith("prefix_query."):
+            grouped["prefix_query"].append((name, parameter))
+        elif name.startswith(("mu_mert_norm_1.", "mu_mert_norm_2.", "mu_mert_norm_3.")):
+            grouped["bridge_norm"].append((name, parameter))
         elif name.startswith("llama.") and any(token in name for token in ("lora", "bias", "norm")):
             grouped["llama_peft"].append((name, parameter))
         else:
@@ -139,7 +149,12 @@ def parameter_groups(model: torch.nn.Module, config: Dict[str, Any]) -> Tuple[Li
             continue
         for decay in (False, True):
             selected = [parameter for name, parameter in named_parameters
-                        if (parameter.ndim > 1 and not name.endswith(".bias")) == decay]
+                        if (
+                            parameter.ndim > 1
+                            and not name.endswith(".bias")
+                            and (not stage2_no_decay or "gate" not in name.lower())
+                            and (not stage2_no_decay or "norm" not in name.lower())
+                        ) == decay]
             if selected:
                 optimizer_groups.append({
                     "params": selected,
@@ -172,7 +187,7 @@ def parameter_groups(model: torch.nn.Module, config: Dict[str, Any]) -> Tuple[Li
         "unexpected_trainable_parameters": unexpected,
         "new_dissonance_parameters": sum(
             parameter.numel() for name, parameter in model.named_parameters()
-            if name.startswith(("ds_encoder.", "ds_fusion."))
+            if name.startswith(("ds_encoder.", "ds_temporal.", "ds_fusion."))
         ),
     }
     return optimizer_groups, summary
@@ -232,13 +247,15 @@ def evaluate_loader(model, loader, device, config, generate_predictions=False, s
     predictions = []
     max_batches = 1 if smoke_test else config.get("validation", {}).get("max_batches")
     generation = config.get("generation", {})
+    precision = config.get("training", {}).get("precision", "fp16")
+    autocast_dtype = torch.bfloat16 if precision == "bf16" else torch.float16
     max_generation_samples = 1 if smoke_test else generation.get("max_samples")
     with torch.no_grad():
         for batch_index, batch in enumerate(loader):
             if max_batches is not None and batch_index >= int(max_batches):
                 break
             examples, labels, _, audio, ds, ds_mask, audio_lengths, metadata = move_batch(batch, device)
-            with torch.cuda.amp.autocast(enabled=device.type == "cuda"):
+            with torch.cuda.amp.autocast(enabled=device.type == "cuda", dtype=autocast_dtype):
                 loss, _, sample_losses = model(
                     examples, labels, audio, dissonance=ds, dissonance_mask=ds_mask,
                     audio_lengths=audio_lengths, return_sample_losses=True,
@@ -279,6 +296,8 @@ def evaluate_loader(model, loader, device, config, generate_predictions=False, s
                         sample_mask[0] if sample_mask is not None else None,
                     ),
                     "gate_mean": float(model_stats["gate_mean"].item()) if "gate_mean" in model_stats else None,
+                    "attention_entropy": float(model_stats["attention_entropy"].item())
+                    if "attention_entropy" in model_stats else None,
                     "ds_residual_ratio": float(model_stats["ds_residual_ratio"].item())
                     if "ds_residual_ratio" in model_stats else None,
                     "generation_seed": seed,
@@ -326,8 +345,21 @@ def load_resume(path, model, optimizer, scaler) -> int:
     except TypeError:
         checkpoint = torch.load(path, map_location="cpu")
     model.load_state_dict(checkpoint["model"], strict=True)
-    optimizer.load_state_dict(checkpoint["optimizer"])
+    try:
+        optimizer.load_state_dict(checkpoint["optimizer"])
+    except ValueError as error:
+        print(f"resume optimizer state reset after a training-stage change: {error}")
     scaler.load_state_dict(checkpoint["scaler"])
+    return int(checkpoint["epoch"]) + 1
+
+
+def resume_start_epoch(path) -> int:
+    if not path:
+        return 0
+    try:
+        checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        checkpoint = torch.load(path, map_location="cpu")
     return int(checkpoint["epoch"]) + 1
 
 
@@ -335,8 +367,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True)
     parser.add_argument("--smoke-test", action="store_true")
+    parser.add_argument("--seed", type=int, default=None)
     args = parser.parse_args()
     config = load_config(args.config)
+    if args.seed is not None:
+        config.setdefault("training", {})["seed"] = int(args.seed)
+        config.setdefault("generation", {})["seed"] = int(args.seed)
     output_dir = run_output_dir(config, args.smoke_test)
     dump_config(config, output_dir / "config_resolved.yaml")
 
@@ -366,7 +402,26 @@ def main() -> int:
         checkpoint_report = misc.load_model(model, checkpoint_path)
         model.to(device)
 
+        trainable_mode = training.get("trainable_mode", "baseline_peft")
+        stage1_epochs = int(training.get("stage1_epochs", 2))
+        planned_start_epoch = resume_start_epoch(training.get("resume"))
+        current_stage = 2 if trainable_mode == "ds_stage2_minimal" and planned_start_epoch >= stage1_epochs else 1
+        if trainable_mode == "ds_stage2_minimal":
+            model.set_stage2_training_stage(1)
+            _, stage1_summary = parameter_groups(model, config)
+            model.set_stage2_training_stage(2)
+            _, stage2_summary = parameter_groups(model, config)
+            model.set_stage2_training_stage(current_stage)
+        else:
+            stage1_summary = stage2_summary = None
         groups, parameter_summary = parameter_groups(model, config)
+        if stage1_summary is not None:
+            parameter_summary = dict(stage2_summary)
+            parameter_summary["stages"] = {
+                "stage_1": stage1_summary,
+                "stage_2": stage2_summary,
+            }
+            parameter_summary["active_stage_at_start"] = current_stage
         (output_dir / "parameter_summary.json").write_text(
             json.dumps(parameter_summary, ensure_ascii=False, indent=2), encoding="utf-8"
         )
@@ -404,33 +459,62 @@ def main() -> int:
         validation_loader = DataLoader(validation_dataset, batch_size=1, shuffle=False, **loader_kwargs)
         writer = SummaryWriter(log_dir=output_dir / "tensorboard")
 
-        epochs = 1 if args.smoke_test else int(training.get("epochs", 20))
+        configured_epochs = int(training.get(
+            "epochs", int(training.get("stage1_epochs", 0)) + int(training.get("stage2_epochs", 0)) or 20
+        ))
+        epochs = 1 if args.smoke_test else configured_epochs
+        warmup_epochs = training.get("warmup_epochs")
+        if warmup_epochs is None:
+            warmup_epochs = float(training.get("warmup_ratio", 0.0)) * epochs
         engine_args = SimpleNamespace(
             accum_iter=1 if args.smoke_test else int(training.get("accum_iter", 1)),
-            warmup_epochs=float(training.get("warmup_epochs", 1)),
+            warmup_epochs=float(warmup_epochs),
             epochs=epochs,
             min_lr=float(training.get("min_lr", 0.0)),
             lr=base_lr,
             max_train_batches=2 if args.smoke_test else training.get("max_train_batches"),
+            precision=training.get("precision", "fp16"),
+            gradient_clip_norm=float(training.get("gradient_clip_norm", 0.0)) or None,
         )
         metrics_path = output_dir / "metrics.jsonl"
         final_predictions = []
         final_evaluation = {}
+        best_val_loss = float("inf")
+        best_epoch = -1
+        epochs_without_improvement = 0
+        patience = int(training.get("early_stopping", {}).get("patience", 0))
+        best_checkpoint = output_dir / "checkpoints" / "checkpoint_best.pth"
+        stopped_early = False
         for epoch in range(start_epoch, epochs):
+            desired_stage = 2 if trainable_mode == "ds_stage2_minimal" and epoch >= stage1_epochs else 1
+            if desired_stage != current_stage:
+                model.set_stage2_training_stage(desired_stage)
+                groups, active_summary = parameter_groups(model, config)
+                base_lr = max(group["lr"] for group in groups)
+                optimizer = torch.optim.AdamW(groups, lr=base_lr, betas=(0.9, 0.95))
+                scaler = misc.NativeScalerWithGradNormCount()
+                engine_args.lr = base_lr
+                current_stage = desired_stage
+                epochs_without_improvement = 0
+                print(json.dumps({
+                    "training_stage": current_stage,
+                    "trainable_parameters": active_summary["trainable_parameters"],
+                }, ensure_ascii=False))
             epoch_start = time.time()
             train_stats = train_one_epoch(
                 model, train_loader, optimizer, device, epoch, scaler,
                 log_writer=writer, args=engine_args,
             )
             is_last = epoch + 1 == epochs
-            validation_stats, predictions = evaluate_loader(
+            validation_stats, _ = evaluate_loader(
                 model, validation_loader, device, config,
-                generate_predictions=is_last, smoke_test=args.smoke_test,
+                generate_predictions=False, smoke_test=args.smoke_test,
             )
             field_names = [
                 "gate_mean", "gate_std", "ds_embedding_norm", "mert_embedding_norm",
                 "fused_embedding_norm", "ds_residual_ratio", "ds_encoder_grad_norm",
-                "ds_fusion_grad_norm", "llama_peft_grad_norm",
+                "attention_entropy", "ds_temporal_grad_norm", "ds_fusion_grad_norm",
+                "llama_peft_grad_norm", "stage2_extra_grad_norm",
             ]
             record = {
                 "epoch": epoch,
@@ -441,6 +525,8 @@ def main() -> int:
                 "epoch_time": time.time() - epoch_start,
                 "peak_gpu_memory": train_stats.get("peak_gpu_memory", 0.0),
             }
+            if trainable_mode == "ds_stage2_minimal":
+                record["training_stage"] = current_stage
             append_jsonl(metrics_path, record)
             for key, value in record.items():
                 if isinstance(value, (int, float)) and key != "epoch":
@@ -451,9 +537,37 @@ def main() -> int:
                     output_dir / "checkpoints" / f"checkpoint_epoch_{epoch:03d}.pth",
                     model, optimizer, scaler, epoch, config,
                 )
-            if is_last:
-                final_evaluation, final_predictions = automatic_evaluation(predictions)
-                final_evaluation.update(validation_stats)
+            current_val = float(validation_stats["val_loss"])
+            if best_epoch < 0 or current_val < best_val_loss:
+                best_val_loss = current_val
+                best_epoch = epoch
+                epochs_without_improvement = 0
+                if patience > 0:
+                    save_checkpoint(best_checkpoint, model, optimizer, scaler, epoch, config)
+            else:
+                epochs_without_improvement += 1
+            if patience > 0 and epochs_without_improvement >= patience:
+                stopped_early = True
+                print(f"early stopping at epoch {epoch}; best epoch was {best_epoch}")
+                break
+
+        if patience > 0 and best_checkpoint.is_file():
+            try:
+                best_state = torch.load(best_checkpoint, map_location="cpu", weights_only=False)
+            except TypeError:
+                best_state = torch.load(best_checkpoint, map_location="cpu")
+            model.load_state_dict(best_state["model"], strict=True)
+        final_validation, final_predictions = evaluate_loader(
+            model, validation_loader, device, config,
+            generate_predictions=True, smoke_test=args.smoke_test,
+        )
+        final_evaluation, final_predictions = automatic_evaluation(final_predictions)
+        final_evaluation.update(final_validation)
+        final_evaluation.update({
+            "best_epoch": best_epoch,
+            "best_val_loss": best_val_loss,
+            "stopped_early": stopped_early,
+        })
 
         with (output_dir / "predictions.jsonl").open("w", encoding="utf-8") as handle:
             for record in final_predictions:
@@ -471,6 +585,15 @@ def main() -> int:
         environment_path.write_text(
             json.dumps(environment, ensure_ascii=False, indent=2, default=str), encoding="utf-8"
         )
+        (output_dir / "completed.json").write_text(json.dumps({
+            "status": "completed",
+            "experiment": config.get("experiment", {}).get("name"),
+            "seed": seed,
+            "split_seed": data_config.get("split_seed", seed),
+            "pretrained_path": str(checkpoint_path),
+            "best_epoch": best_epoch,
+            "config_source": config.get("_config_path"),
+        }, ensure_ascii=False, indent=2), encoding="utf-8")
         writer.close()
         print(f"completed: {output_dir}")
     log_handle.close()

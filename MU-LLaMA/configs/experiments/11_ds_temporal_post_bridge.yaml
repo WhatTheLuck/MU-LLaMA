@@ -1,0 +1,7 @@
+base: 10_ds_temporal_pre_proj.yaml
+experiment:
+  name: 11_ds_temporal_post_bridge
+model:
+  dissonance:
+    fusion:
+      position: post_bridge
