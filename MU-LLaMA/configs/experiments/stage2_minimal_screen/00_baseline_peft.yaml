@@ -1,0 +1,10 @@
+base: ../00_baseline_peft.yaml
+training:
+  seed: 42
+  epochs: 4
+  save_every: 4
+  precision: bf16
+  early_stopping:
+    patience: 2
+generation:
+  seed: 42

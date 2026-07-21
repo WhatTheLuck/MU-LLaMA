@@ -25,6 +25,8 @@ See [`docs/ds_stage2_update.md`](./docs/ds_stage2_update.md) for the design, saf
 
 The operational Stage 2 scheduler uses separate 6-epoch budget overlays after an observed A100 epoch time of roughly 4.8 hours. It preserves full data, full validation, patience-2 early stopping, and best-checkpoint evaluation while keeping the original experiment configs unchanged.
 
+For a faster first decision, `MU-LLaMA/scripts/submit_minimal_screen.py` runs only 00/10/11/12 as a parallel DAG with 4-epoch overlays and a lightweight learned-scalar temporal gate. A token-length audit must approve any sequence reduction below 512.
+
 The demo page with more information regarding the MU-LLaMA model is avilable [here](https://crypto-code.github.io/MU-LLaMA-Demo/).
 
 ## Introduction

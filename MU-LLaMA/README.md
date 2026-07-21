@@ -45,3 +45,22 @@ With `cluster.workdir: .`, the submitter resolves the repository directory from 
 Because a full epoch was observed to take about 4.8 hours on the target A100, `stage2_core` now selects additive configs under `configs/experiments/stage2_core_budget/`: at most 6 epochs, early-stopping patience 2, full data and validation, and one periodic save at epoch 6. The original 00–12 configs are unchanged. Budgeted Slurm jobs carry a `_b6` suffix and receive a 40-hour limit, leaving headroom beyond the roughly 28.8-hour worst-case training body for validation, generation, and checkpoint I/O.
 
 No benchmark values are bundled or fabricated. See `../docs/ds_stage2_update.md` for implementation and verification details.
+
+### Minimal screening DAG
+
+For the shortest position/feature comparison, use the additive four-run screen `00/10/11/12`. It uses 4 epochs, a 1+3 staged schedule, 128-dimensional temporal attention, a one-parameter learned scalar gate, and parallel cache/training branches. Original and six-run budget configs remain unchanged.
+
+Audit whether 256 tokens preserves at least 99% of real samples:
+
+```bash
+python tools/audit_token_lengths.py --require-max-words 256
+```
+
+If the audit passes:
+
+```bash
+python scripts/submit_minimal_screen.py --max-words 256 --dry-run
+python scripts/submit_minimal_screen.py --max-words 256
+```
+
+If it fails, omit `--max-words 256`; the safe default is 512. The DAG starts the DS cache, CQT cache, and baseline independently; 10/11 wait only for the DS cache, 12 waits only for the CQT cache, and analysis joins all four completed training jobs.

@@ -30,7 +30,7 @@ import util.misc as misc
 from data.dataset import FinetuneDataset, finetune_collate, transform_train
 from engine_finetune import train_one_epoch
 from llama.llama_adapter import LLaMA_adapter
-from util.config import dump_config, load_config
+from util.config import config_fingerprint, dump_config, load_config
 
 
 class Tee:
@@ -368,11 +368,16 @@ def main() -> int:
     parser.add_argument("--config", required=True)
     parser.add_argument("--smoke-test", action="store_true")
     parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--max-words", type=int, default=None)
     args = parser.parse_args()
     config = load_config(args.config)
     if args.seed is not None:
         config.setdefault("training", {})["seed"] = int(args.seed)
         config.setdefault("generation", {})["seed"] = int(args.seed)
+    if args.max_words is not None:
+        if args.max_words < 32:
+            raise ValueError("--max-words must be at least 32")
+        config.setdefault("model", {})["max_words"] = int(args.max_words)
     output_dir = run_output_dir(config, args.smoke_test)
     dump_config(config, output_dir / "config_resolved.yaml")
 
@@ -591,8 +596,10 @@ def main() -> int:
             "seed": seed,
             "split_seed": data_config.get("split_seed", seed),
             "pretrained_path": str(checkpoint_path),
+            "max_words": int(model_config.get("max_words", 512)),
             "best_epoch": best_epoch,
             "config_source": config.get("_config_path"),
+            "config_fingerprint": config_fingerprint(config),
         }, ensure_ascii=False, indent=2), encoding="utf-8")
         writer.close()
         print(f"completed: {output_dir}")

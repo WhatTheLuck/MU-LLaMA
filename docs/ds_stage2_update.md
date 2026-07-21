@@ -25,6 +25,20 @@ Analysis writes overall, harmony, and other rows. It uses an existing `question_
 
 Extra seeds 3407 and 2026 are gated by analysis: experiment `11` must outperform `00`, `01`, and `12`. Only then does `stage2_followup` allow `00`, `11`, and `12` to be submitted for those seeds.
 
+## Minimal screening profile
+
+The additive `stage2_minimal_screen` profile is the fastest experiment set that still answers all three first-round questions:
+
+- `00` vs `11`: whether temporal DS improves over the no-DS baseline;
+- `10` vs `11`: whether `post_bridge` is preferable to `pre_proj`;
+- `11` vs `12`: whether the effect is DS-specific rather than a generic processed-CQT effect.
+
+Experiments 01 and 09 are deferred rather than deleted. Minimal temporal configs use 128-dimensional tokens and attention, kernel 3, a single learned gate logit, four epochs, and a 1+3 stage schedule. The learned scalar removes the large sample-conditioned gate MLP while attention remains sample-conditioned through the MERT query.
+
+`submit_minimal_screen.py` creates a DAG rather than a serial chain. DS/CQT caches and the baseline can start independently; 10 and 11 share the DS-cache dependency, 12 depends on the CQT cache, and the minimal analysis job joins 00/10/11/12. With enough A100 allocation this reduces wall-clock time without changing the evaluated data.
+
+Sequence length remains 512 unless `tools/audit_token_lengths.py` demonstrates that a shorter candidate truncates no more than 1% of the real prompt-answer samples. `submit_minimal_screen.py` refuses a shorter `--max-words` value without a passing audit JSON.
+
 ## Verification commands
 
 ```bash

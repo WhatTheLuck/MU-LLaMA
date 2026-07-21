@@ -10,6 +10,7 @@ cluster:
   memory: 64G
   time: "24:00:00"
   stage2_time: "40:00:00"
+  minimal_time: "30:00:00"
   gres: gpu:a100:1
   python_executable: python
   conda_env: null

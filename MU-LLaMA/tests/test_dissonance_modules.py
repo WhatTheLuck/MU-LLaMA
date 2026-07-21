@@ -113,14 +113,18 @@ class DissonanceModuleTest(unittest.TestCase):
         fusion.load_state_dict(checkpoint["fusion"], strict=True)
         fusion.eval()
         self.assertEqual(tuple(fusion(base, tokens_clean, token_mask)[0].shape), (2, 64))
-        configured_temporal = DSTemporalEncoder(input_dim=128, token_dim=256)
+        configured_temporal = DSTemporalEncoder(input_dim=128, token_dim=128, conv_kernel=3)
         configured_post_bridge = TemporalGatedAttentionFusion(
-            base_dim=4096, token_dim=256, attention_dim=256
+            base_dim=4096, token_dim=128, attention_dim=128, gate="learned_scalar", hidden_dim=64
         )
         self.assertLess(
             sum(p.numel() for p in configured_temporal.parameters())
             + sum(p.numel() for p in configured_post_bridge.parameters()),
-            5_000_000,
+            2_000_000,
+        )
+        self.assertAlmostEqual(
+            torch.sigmoid(configured_post_bridge.gate_logit).item(),
+            torch.sigmoid(torch.tensor(-3.0)).item(), places=6,
         )
 
     def test_stage2_trainability(self):
@@ -186,6 +190,20 @@ class DissonanceModuleTest(unittest.TestCase):
             self.assertEqual(budget["training"]["epochs"], 6)
             self.assertEqual(budget["training"]["early_stopping"]["patience"], 2)
             self.assertEqual(budget["training"]["save_every"], 6)
+
+        minimal_root = config_root / "stage2_minimal_screen"
+        for name in (
+            "00_baseline_peft.yaml", "10_ds_temporal_pre_proj.yaml",
+            "11_ds_temporal_post_bridge.yaml", "12_cqt_temporal_post_bridge.yaml",
+        ):
+            minimal = load_config(minimal_root / name)
+            self.assertEqual(minimal["training"]["epochs"], 4)
+            self.assertEqual(minimal["training"]["early_stopping"]["patience"], 2)
+            if name.startswith(("10_", "11_", "12_")):
+                ds = minimal["model"]["dissonance"]
+                self.assertEqual(ds["temporal"]["token_dim"], 128)
+                self.assertEqual(ds["fusion"]["attention_dim"], 128)
+                self.assertEqual(ds["fusion"]["gate"], "learned_scalar")
 
         common = {"enabled": True, "cache_root": tempfile.mkdtemp(), "feature": {
             "n_octaves": 2, "bins_per_octave": 12,

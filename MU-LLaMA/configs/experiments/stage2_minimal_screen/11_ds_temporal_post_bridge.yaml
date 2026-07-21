@@ -1,0 +1,17 @@
+base: ../11_ds_temporal_post_bridge.yaml
+model:
+  dissonance:
+    temporal:
+      token_dim: 128
+      conv_kernel: 3
+    fusion:
+      attention_dim: 128
+      gate: learned_scalar
+      hidden_dim: 64
+training:
+  epochs: 4
+  stage1_epochs: 1
+  stage2_epochs: 3
+  save_every: 4
+  early_stopping:
+    patience: 2

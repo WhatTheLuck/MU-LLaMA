@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import copy
+import hashlib
+import json
 import os
 from pathlib import Path
 from typing import Any, Dict, Iterable
@@ -57,3 +59,9 @@ def dump_config(config: Dict[str, Any], path: str | Path) -> None:
     with Path(path).open("w", encoding="utf-8") as handle:
         yaml.safe_dump(serializable, handle, allow_unicode=True, sort_keys=False)
 
+
+def config_fingerprint(config: Dict[str, Any]) -> str:
+    """Stable identity for the fully resolved, behavior-bearing configuration."""
+    serializable = {key: value for key, value in config.items() if not key.startswith("_")}
+    payload = json.dumps(serializable, sort_keys=True, ensure_ascii=True, default=str)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]

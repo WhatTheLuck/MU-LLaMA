@@ -250,19 +250,25 @@ class TemporalGatedAttentionFusion(nn.Module):
         super().__init__()
         if int(num_heads) != 1:
             raise ValueError("Stage 2 temporal fusion currently requires num_heads=1")
-        if gate != "scalar":
-            raise ValueError("Stage 2 temporal fusion requires a scalar gate")
+        if gate not in {"scalar", "learned_scalar"}:
+            raise ValueError("Stage 2 temporal fusion gate must be scalar or learned_scalar")
+        self.gate_type = gate
         self.attention_dim = int(attention_dim)
         self.query = nn.Linear(int(base_dim), self.attention_dim, bias=False)
         self.key = nn.Linear(int(token_dim), self.attention_dim, bias=False)
         self.value = nn.Linear(int(token_dim), self.attention_dim, bias=False)
         self.context_projection = nn.Linear(self.attention_dim, int(base_dim))
-        self.gate_layer = nn.Sequential(
-            nn.Linear(int(base_dim) * 2, int(hidden_dim)),
-            nn.SiLU(),
-            nn.Linear(int(hidden_dim), 1),
-        )
-        nn.init.constant_(self.gate_layer[-1].bias, float(gate_bias_init))
+        if gate == "learned_scalar":
+            self.gate_logit = nn.Parameter(torch.tensor(float(gate_bias_init)))
+            self.gate_layer = None
+        else:
+            self.register_parameter("gate_logit", None)
+            self.gate_layer = nn.Sequential(
+                nn.Linear(int(base_dim) * 2, int(hidden_dim)),
+                nn.SiLU(),
+                nn.Linear(int(hidden_dim), 1),
+            )
+            nn.init.constant_(self.gate_layer[-1].bias, float(gate_bias_init))
         if output_zero_init:
             nn.init.zeros_(self.context_projection.weight)
             nn.init.zeros_(self.context_projection.bias)
@@ -288,7 +294,10 @@ class TemporalGatedAttentionFusion(nn.Module):
         attention = torch.softmax(scores.float(), dim=-1).to(value.dtype)
         context = torch.matmul(attention, value).squeeze(1)
         projected = self.context_projection(context)
-        gate = torch.sigmoid(self.gate_layer(torch.cat((base, projected), dim=-1)))
+        if self.gate_type == "learned_scalar":
+            gate = torch.sigmoid(self.gate_logit).to(base.dtype).expand(base.shape[0], 1)
+        else:
+            gate = torch.sigmoid(self.gate_layer(torch.cat((base, projected), dim=-1)))
         residual = gate * projected * valid.to(base.dtype).unsqueeze(1)
         fused = base + residual
         entropy = -(attention.float().clamp_min(1e-12).log() * attention.float()).sum(dim=-1)

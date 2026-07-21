@@ -24,6 +24,14 @@ STAGE2_COMPARISONS = [
     ("10_ds_temporal_pre_proj", "11_ds_temporal_post_bridge"),
     ("11_ds_temporal_post_bridge", "12_cqt_temporal_post_bridge"),
 ]
+MINIMAL_STAGE2_EXPERIMENTS = [
+    "10_ds_temporal_pre_proj", "11_ds_temporal_post_bridge", "12_cqt_temporal_post_bridge",
+]
+MINIMAL_STAGE2_COMPARISONS = [
+    ("00_baseline_peft", "11_ds_temporal_post_bridge"),
+    ("10_ds_temporal_pre_proj", "11_ds_temporal_post_bridge"),
+    ("11_ds_temporal_post_bridge", "12_cqt_temporal_post_bridge"),
+]
 HARMONY_KEYWORDS = (
     "harmony", "harmonic", "chord", "tonal", "tonality", "key", "mode",
     "dissonance", "consonance", "cadence", "interval", "pitch",
@@ -248,24 +256,44 @@ def make_figures(root: Path, baseline: str, experiments: List[str], runs: Dict[s
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=Path("outputs"))
+    parser.add_argument("--report-dir", type=Path)
     parser.add_argument("--baseline")
     parser.add_argument("--experiments", nargs="+")
     parser.add_argument("--stage2", action="store_true")
+    parser.add_argument("--minimal-stage2", action="store_true")
     parser.add_argument("--bootstrap-samples", type=int, default=2000)
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
+    if args.stage2 and args.minimal_stage2:
+        parser.error("--stage2 and --minimal-stage2 are mutually exclusive")
+    comparisons = None
+    result_prefix = None
+    followup_controls = None
     if args.stage2:
         args.baseline = "00_baseline_peft"
         args.experiments = STAGE2_EXPERIMENTS
+        comparisons = STAGE2_COMPARISONS
+        result_prefix = "stage2"
+        followup_controls = ["00_baseline_peft", "01_ds_default", "12_cqt_temporal_post_bridge"]
+    elif args.minimal_stage2:
+        args.baseline = "00_baseline_peft"
+        args.experiments = MINIMAL_STAGE2_EXPERIMENTS
+        comparisons = MINIMAL_STAGE2_COMPARISONS
+        result_prefix = "minimal_stage2"
+        followup_controls = [
+            "00_baseline_peft", "10_ds_temporal_pre_proj", "12_cqt_temporal_post_bridge",
+        ]
     if not args.baseline or not args.experiments:
         parser.error("--baseline and --experiments are required unless --stage2 is used")
     args.root.mkdir(parents=True, exist_ok=True)
+    report_root = args.report_dir or args.root
+    report_root.mkdir(parents=True, exist_ok=True)
 
     runs = {}
     rows = []
     names = [args.baseline, *args.experiments]
     for index, name in enumerate(names):
-        run = latest_run(args.root, name, seed=42 if args.stage2 else None)
+        run = latest_run(args.root, name, seed=42 if comparisons is not None else None)
         if run is None:
             print(f"skip {name}: no completed run found")
             continue
@@ -309,15 +337,15 @@ def main() -> int:
 
     if not rows:
         raise RuntimeError("No real experiment outputs were found; analysis will not fabricate data")
-    if args.stage2:
+    if comparisons is not None:
         missing = [name for name in names if name not in runs]
         if missing:
-            raise RuntimeError(f"Stage 2 analysis requires all round-1 runs; missing: {missing}")
-    write_summary(rows, args.root)
-    make_figures(args.root, args.baseline, args.experiments, runs)
-    if args.stage2:
+            raise RuntimeError(f"{result_prefix} analysis requires all selected runs; missing: {missing}")
+    write_summary(rows, report_root)
+    make_figures(report_root, args.baseline, args.experiments, runs)
+    if comparisons is not None:
         comparison_rows = []
-        for comparison_index, (left, right) in enumerate(STAGE2_COMPARISONS):
+        for comparison_index, (left, right) in enumerate(comparisons):
             if left not in runs or right not in runs:
                 continue
             for group in ("overall", "harmony", "other"):
@@ -333,12 +361,10 @@ def main() -> int:
                     "paired_metric": metric,
                     **paired_statistics(differences, args.bootstrap_samples, args.seed + comparison_index),
                 })
-        with (args.root / "stage2_comparisons.json").open("w", encoding="utf-8") as handle:
+        with (report_root / f"{result_prefix}_comparisons.json").open("w", encoding="utf-8") as handle:
             json.dump(comparison_rows, handle, ensure_ascii=False, indent=2)
         recommended = runs.get("11_ds_temporal_post_bridge", {}).get("evaluation", {})
-        controls = [runs.get(name, {}).get("evaluation", {}) for name in (
-            "00_baseline_peft", "01_ds_default", "12_cqt_temporal_post_bridge"
-        )]
+        controls = [runs.get(name, {}).get("evaluation", {}) for name in followup_controls]
         def score(item):
             for key in ("bertscore_f1", "rouge_l", "meteor", "bleu"):
                 value = item.get(key)
@@ -346,16 +372,17 @@ def main() -> int:
                     return float(value)
             return -float("inf")
         eligible = bool(recommended) and all(control and score(recommended) > score(control) for control in controls)
-        (args.root / "stage2_followup.json").write_text(json.dumps({
+        rule = "11 must outperform " + ", ".join(followup_controls)
+        (report_root / f"{result_prefix}_followup.json").write_text(json.dumps({
             "eligible": eligible,
-            "rule": "11 must outperform 00, 01, and 12 before running seeds 3407 and 2026",
+            "rule": rule + " before running seeds 3407 and 2026",
             "experiments": ["00_baseline_peft", "11_ds_temporal_post_bridge", "12_cqt_temporal_post_bridge"],
             "seeds": [3407, 2026],
         }, ensure_ascii=False, indent=2), encoding="utf-8")
-        (args.root / "stage2_analysis_complete.json").write_text(json.dumps({
+        (report_root / f"{result_prefix}_analysis_complete.json").write_text(json.dumps({
             "status": "completed", "experiments": [args.baseline, *args.experiments]
         }, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"wrote {args.root / 'summary.csv'}, {args.root / 'summary.md'}, and {args.root / 'figures'}")
+    print(f"wrote {report_root / 'summary.csv'}, {report_root / 'summary.md'}, and {report_root / 'figures'}")
     return 0
 
 

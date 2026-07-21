@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
 import shlex
@@ -15,7 +16,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from util.config import load_config  # noqa: E402
+from util.config import config_fingerprint, load_config  # noqa: E402
 
 
 def add_optional(command, flag, value):
@@ -43,10 +44,24 @@ def experiment_config_path(workdir: Path, experiment: str, group: str) -> Path:
     return workdir / "configs" / "experiments" / f"{experiment}.yaml"
 
 
-def completed_run(config_path: Path, workdir: Path, experiment: str, seed: int) -> Path | None:
+def completed_run(
+    config_path: Path, workdir: Path, experiment: str, seed: int,
+    expected_max_words: int | None = None,
+    require_exact_config: bool = False,
+) -> Path | None:
     if not config_path.is_file():
         return None
     experiment_config = load_config(config_path)
+    expected_max_words = int(
+        expected_max_words
+        if expected_max_words is not None
+        else experiment_config.get("model", {}).get("max_words", 512)
+    )
+    expected_config = copy.deepcopy(experiment_config)
+    expected_config.setdefault("training", {})["seed"] = int(seed)
+    expected_config.setdefault("generation", {})["seed"] = int(seed)
+    expected_config.setdefault("model", {})["max_words"] = expected_max_words
+    expected_fingerprint = config_fingerprint(expected_config)
     output_root = Path(experiment_config.get("output", {}).get("root", "outputs"))
     if not output_root.is_absolute():
         output_root = workdir / output_root
@@ -64,12 +79,16 @@ def completed_run(config_path: Path, workdir: Path, experiment: str, seed: int) 
                 continue
             expected_split = experiment_config.get("data", {}).get("split_seed")
             expected_checkpoint = experiment_config.get("model", {}).get("pretrained_path")
-            if (
+            compatible = (
                 state.get("status") == "completed"
                 and int(state.get("seed", -1)) == int(seed)
                 and state.get("split_seed") == expected_split
                 and str(state.get("pretrained_path")) == str(expected_checkpoint)
-            ):
+                and int(state.get("max_words", 512)) == expected_max_words
+            )
+            if require_exact_config:
+                compatible = compatible and state.get("config_fingerprint") == expected_fingerprint
+            if compatible:
                 return marker
         # Stage 1 runs predate completed.json. Reuse only a fully materialized
         # run with the same seed, data split, and common pretrained checkpoint.
@@ -88,7 +107,12 @@ def completed_run(config_path: Path, workdir: Path, experiment: str, seed: int) 
         same_checkpoint = str(old_model.get("pretrained_path")) == str(
             experiment_config.get("model", {}).get("pretrained_path")
         )
-        if same_seed and same_split and same_checkpoint:
+        same_max_words = int(old_model.get("max_words", 512)) == expected_max_words
+        exact_config = config_fingerprint(old_config) == expected_fingerprint
+        if (
+            same_seed and same_split and same_checkpoint and same_max_words
+            and (not require_exact_config or exact_config)
+        ):
             return run_dir / "evaluation.json"
     return None
 
