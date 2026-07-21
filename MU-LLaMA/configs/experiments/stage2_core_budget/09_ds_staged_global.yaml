@@ -1,0 +1,8 @@
+base: ../09_ds_staged_global.yaml
+training:
+  epochs: 6
+  stage1_epochs: 2
+  stage2_epochs: 4
+  save_every: 6
+  early_stopping:
+    patience: 2

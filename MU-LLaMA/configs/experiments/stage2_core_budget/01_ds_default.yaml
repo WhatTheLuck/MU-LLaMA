@@ -1,0 +1,9 @@
+base: ../01_ds_default.yaml
+training:
+  seed: 42
+  epochs: 6
+  save_every: 6
+  early_stopping:
+    patience: 2
+generation:
+  seed: 42

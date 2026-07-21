@@ -176,6 +176,17 @@ class DissonanceModuleTest(unittest.TestCase):
             self.assertEqual(ds["fusion"]["position"], position)
             self.assertEqual(ds["input_feature"], feature)
 
+        budget_root = config_root / "stage2_core_budget"
+        for name in (
+            "00_baseline_peft.yaml", "01_ds_default.yaml", "09_ds_staged_global.yaml",
+            "10_ds_temporal_pre_proj.yaml", "11_ds_temporal_post_bridge.yaml",
+            "12_cqt_temporal_post_bridge.yaml",
+        ):
+            budget = load_config(budget_root / name)
+            self.assertEqual(budget["training"]["epochs"], 6)
+            self.assertEqual(budget["training"]["early_stopping"]["patience"], 2)
+            self.assertEqual(budget["training"]["save_every"], 6)
+
         common = {"enabled": True, "cache_root": tempfile.mkdtemp(), "feature": {
             "n_octaves": 2, "bins_per_octave": 12,
         }}

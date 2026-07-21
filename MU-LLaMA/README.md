@@ -42,4 +42,6 @@ python scripts/submit_sequence.py --group stage2_followup
 
 With `cluster.workdir: .`, the submitter resolves the repository directory from its own location, so it can also be called from outside the checkout. Null partition/account/QoS values are omitted and left to the cluster defaults; a null Conda environment keeps the agent's currently active environment.
 
+Because a full epoch was observed to take about 4.8 hours on the target A100, `stage2_core` now selects additive configs under `configs/experiments/stage2_core_budget/`: at most 6 epochs, early-stopping patience 2, full data and validation, and one periodic save at epoch 6. The original 00–12 configs are unchanged. Budgeted Slurm jobs carry a `_b6` suffix and receive a 40-hour limit, leaving headroom beyond the roughly 28.8-hour worst-case training body for validation, generation, and checkpoint I/O.
+
 No benchmark values are bundled or fabricated. See `../docs/ds_stage2_update.md` for implementation and verification details.

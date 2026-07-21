@@ -23,6 +23,8 @@ python scripts/submit_sequence.py --group stage2_core
 
 See [`docs/ds_stage2_update.md`](./docs/ds_stage2_update.md) for the design, safeguards, experiment order, and verification commands. No performance values are claimed without real cluster runs.
 
+The operational Stage 2 scheduler uses separate 6-epoch budget overlays after an observed A100 epoch time of roughly 4.8 hours. It preserves full data, full validation, patience-2 early stopping, and best-checkpoint evaluation while keeping the original experiment configs unchanged.
+
 The demo page with more information regarding the MU-LLaMA model is avilable [here](https://crypto-code.github.io/MU-LLaMA-Demo/).
 
 ## Introduction

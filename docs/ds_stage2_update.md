@@ -12,13 +12,14 @@ The Stage 1 branch encoded each Dissonance Spectrum as one global vector. The CN
 - `post_bridge` applies fusion after all three MERT bridge blocks and before the audio vector is combined with the LLaMA prefix queries. Training, validation, inference, and generation all use the same `forward_audio` path.
 - `ds_stage2_minimal` trains only DS encoder/temporal/fusion parameters for epochs 1–2. From epoch 3 it additionally trains `prefix_query` and `mu_mert_norm_1/2/3`; MERT, `mu_mert_proj`, bridge linears, LLaMA/LoRA, and the output head stay frozen.
 - Optimizer groups use `1e-4` for DS encoder/temporal/fusion and `2e-5` for prefix queries and bridge norms. Stage 2 configs use bf16, batch size 1, accumulation 32, gradient clipping 1, weight decay 0.01, 10% warmup, cosine decay, and early-stopping patience 2. Biases, gates, and norms have no weight decay in this mode.
+- The original 00–12 definitions remain available for provenance. Operational `stage2_core` submissions select additive `stage2_core_budget` overlays capped at 6 epochs. Staged experiments retain two DS-only epochs followed by up to four minimal-unfreeze epochs. Full training and validation data are retained; this is not a smoke-test or batch truncation.
 - Cache metadata now records configured/effective FPS and hop length plus frequency and time dimensions. If FPS overrides hop length, both configured and effective values remain visible. Config `12` gets a separate cache hash and reads the original `processed_calc_cqt` returned by the feature implementation.
 
 The temporal module is below 1M parameters. The largest temporal fusion variant (`post_bridge`, dimension 4096) is below 5M parameters. MERT and LLaMA remain frozen in the Stage 2 mode.
 
 ## Experiment and scheduler contract
 
-Round 1 is `00`, `01`, `09`, `10`, `11`, and `12` with seed 42. `stage2_core` submits them in order, including the config-12 cache and final analysis, using `afterok` dependencies. A successful `completed.json` causes default skipping; `--force` overrides that behavior. Dry-run prints every command and dependency without submitting.
+Round 1 is `00`, `01`, `09`, `10`, `11`, and `12` with seed 42. `stage2_core` submits them in order, including the config-12 cache and final analysis, using `afterok` dependencies. Its budgeted training jobs have a `_b6` suffix and a 40-hour Slurm limit. At the observed rate of about 4.8 hours per epoch, six epochs require about 28.8 hours before final validation/generation overhead. A successful `completed.json` causes default skipping; `--force` overrides that behavior. Dry-run prints every command and dependency without submitting.
 
 Analysis writes overall, harmony, and other rows. It uses an existing `question_type` when available; otherwise it classifies only the question text with the fixed harmony keyword list in `scripts/analyze_results.py`. It reports the five adjacent comparisons required by the design. It never hides the overall result.
 

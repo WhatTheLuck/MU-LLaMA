@@ -4,11 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shlex
 import subprocess
 import sys
-import json
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -33,8 +33,17 @@ def sequence_for(group: str, groups: dict):
     return list(groups[group])
 
 
-def completed_run(workdir: Path, experiment: str, seed: int) -> Path | None:
-    config_path = workdir / "configs" / "experiments" / f"{experiment}.yaml"
+def experiment_config_path(workdir: Path, experiment: str, group: str) -> Path:
+    if group in {"stage2_core", "stage2_followup"}:
+        budget_path = (
+            workdir / "configs" / "experiments" / "stage2_core_budget" / f"{experiment}.yaml"
+        )
+        if budget_path.is_file():
+            return budget_path
+    return workdir / "configs" / "experiments" / f"{experiment}.yaml"
+
+
+def completed_run(config_path: Path, workdir: Path, experiment: str, seed: int) -> Path | None:
     if not config_path.is_file():
         return None
     experiment_config = load_config(config_path)
@@ -119,6 +128,14 @@ def main() -> int:
         is_cache = step.startswith("cache_")
         is_analysis = step in {"analyze_results", "analyze_stage2"}
         experiment = step[len("cache_"):] if is_cache else step
+        selected_config = None if is_analysis else experiment_config_path(workdir, experiment, args.group)
+        if selected_config is not None and not selected_config.is_file():
+            raise FileNotFoundError(f"Experiment config not found: {selected_config}")
+        config_argument = (
+            str(selected_config.relative_to(workdir))
+            if selected_config is not None and selected_config.is_relative_to(workdir)
+            else str(selected_config) if selected_config is not None else None
+        )
         stage2_seed = explicit_seed if explicit_seed is not None else (42 if args.group == "stage2_core" else None)
         completion_target = experiment
         if is_cache:
@@ -126,9 +143,9 @@ def main() -> int:
         completion = None
         if not is_analysis:
             completion = completed_run(
-                workdir, completion_target,
+                selected_config, workdir, completion_target,
                 stage2_seed if stage2_seed is not None else int(
-                    load_config(workdir / "configs" / "experiments" / f"{completion_target}.yaml")
+                    load_config(selected_config)
                     .get("training", {}).get("seed", 0)
                 ),
             )
@@ -139,12 +156,19 @@ def main() -> int:
             print(f"skip completed {step}: {completion}")
             continue
         job_label = f"{step}_seed{stage2_seed}" if explicit_seed is not None else step
+        if args.group in {"stage2_core", "stage2_followup"} and not is_analysis:
+            job_label = f"{job_label}_b6"
         command = ["sbatch", "--parsable", f"--job-name={job_label}"]
         command.extend(("--nodes", str(cluster.get("nodes", 1))))
         command.extend(("--ntasks", str(cluster.get("tasks", 1))))
         command.extend(("--cpus-per-task", str(cluster.get("cpus_per_task", 8))))
         command.extend(("--mem", str(cluster.get("memory", "64G"))))
-        command.extend(("--time", str(cluster.get("time", "24:00:00"))))
+        time_limit = (
+            cluster.get("stage2_time", "40:00:00")
+            if args.group in {"stage2_core", "stage2_followup"}
+            else cluster.get("time", "24:00:00")
+        )
+        command.extend(("--time", str(time_limit)))
         add_optional(command, "--partition", cluster.get("partition"))
         add_optional(command, "--account", cluster.get("account"))
         add_optional(command, "--qos", cluster.get("qos"))
@@ -156,7 +180,7 @@ def main() -> int:
 
         if is_cache:
             command.extend((str(PROJECT_ROOT / "slurm" / "cache.slurm"),
-                            f"configs/experiments/{experiment}.yaml"))
+                            config_argument))
             if args.force:
                 command.append("--force")
         elif step == "analyze_stage2":
@@ -173,7 +197,7 @@ def main() -> int:
             ))
         else:
             command.extend((str(PROJECT_ROOT / "slurm" / "train.slurm"), "train",
-                            f"configs/experiments/{experiment}.yaml"))
+                            config_argument))
             if stage2_seed is not None:
                 command.extend(("--seed", str(stage2_seed)))
 
