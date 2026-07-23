@@ -11,6 +11,7 @@ from llama.dissonance_modules import (
     DSTemporalEncoder,
     GatedResidualFusion,
     TemporalGatedAttentionFusion,
+    _resize_time_mask,
     build_ds_encoder,
     build_ds_temporal_encoder,
 )
@@ -18,6 +19,13 @@ from util.config import load_config
 
 
 class DissonanceModuleTest(unittest.TestCase):
+    def test_time_mask_resize_stays_out_of_bfloat16(self):
+        mask = torch.tensor([[True, True, False, False]])
+        with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+            resized = _resize_time_mask(mask, 2)
+        self.assertEqual(resized.dtype, torch.bool)
+        self.assertTrue(torch.equal(resized, torch.tensor([[True, False]])))
+
     def test_disabled_adapter_never_loads_cache(self):
         adapter = DissonanceFeatureAdapter({"enabled": False})
         with self.assertRaisesRegex(RuntimeError, "disabled"):

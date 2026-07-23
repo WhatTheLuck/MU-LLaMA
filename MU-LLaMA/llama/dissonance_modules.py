@@ -16,6 +16,13 @@ def _masked_mean(values: torch.Tensor, mask: torch.Tensor, dim: int) -> torch.Te
     return (values * weights).sum(dim=dim) / denominator
 
 
+def _resize_time_mask(time_mask: torch.Tensor, size: int) -> torch.Tensor:
+    """Resize binary masks in FP32 for PyTorch versions without BF16 interpolation."""
+    return F.interpolate(
+        time_mask[:, None, :].to(dtype=torch.float32), size=size, mode="nearest"
+    ).squeeze(1).ge(0.5)
+
+
 class CNNSmallEncoder(nn.Module):
     def __init__(self, embedding_dim: int, hidden_dim: int, dropout: float):
         super().__init__()
@@ -40,9 +47,7 @@ class CNNSmallEncoder(nn.Module):
         return self.network(spectrum.unsqueeze(1))
 
     def pool_feature_map(self, features: torch.Tensor, time_mask: torch.Tensor) -> torch.Tensor:
-        resized_mask = F.interpolate(
-            time_mask[:, None, :].to(features.dtype), size=features.shape[-1], mode="nearest"
-        ).squeeze(1)
+        resized_mask = _resize_time_mask(time_mask, features.shape[-1])
         pooled_frequency = features.mean(dim=2)
         pooled = _masked_mean(pooled_frequency, resized_mask[:, None, :], dim=-1)
         return self.output(pooled)
@@ -151,10 +156,7 @@ class DSTemporalEncoder(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if feature_map.ndim != 4:
             raise ValueError("DS temporal input must have shape [B,C,F,T]")
-        resized_mask = F.interpolate(
-            time_mask[:, None, :].to(feature_map.dtype),
-            size=feature_map.shape[-1], mode="nearest",
-        ).squeeze(1).bool()
+        resized_mask = _resize_time_mask(time_mask, feature_map.shape[-1])
         # Frequency is summarized, but time is deliberately retained and ordered.
         tokens = feature_map.mean(dim=2).transpose(1, 2)
         tokens = self.input_projection(tokens)
