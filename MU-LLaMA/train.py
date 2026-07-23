@@ -7,6 +7,7 @@ import argparse
 import contextlib
 import datetime as dt
 import hashlib
+import importlib.metadata as importlib_metadata
 import importlib.util
 import json
 import math
@@ -57,12 +58,18 @@ def read_jsonl_for_summary(path: Path) -> List[dict]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
-def set_seed(seed: int) -> None:
+def set_seed(seed: int, deterministic: bool = False, warn_only: bool = False) -> None:
+    if deterministic:
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+    if deterministic:
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+        torch.use_deterministic_algorithms(True, warn_only=warn_only)
 
 
 def run_output_dir(config: Dict[str, Any], smoke_test: bool) -> Path:
@@ -90,18 +97,91 @@ def git_value(repo: Path, *args: str) -> str:
         return f"unavailable: {error}"
 
 
+def system_memory_bytes() -> int | None:
+    try:
+        return int(os.sysconf("SC_PAGE_SIZE")) * int(os.sysconf("SC_PHYS_PAGES"))
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+
+
+def cpu_model() -> str:
+    processor = platform.processor().strip()
+    cpuinfo = Path("/proc/cpuinfo")
+    if cpuinfo.is_file():
+        for line in cpuinfo.read_text(encoding="utf-8", errors="replace").splitlines():
+            if line.lower().startswith("model name") and ":" in line:
+                return line.split(":", 1)[1].strip()
+    return processor or "unknown"
+
+
+def package_versions() -> Dict[str, str | None]:
+    packages = (
+        "torch", "torchaudio", "torchvision", "transformers", "sentencepiece",
+        "numpy", "scipy", "librosa", "PyYAML", "nltk", "rouge-score",
+        "bert-score", "matplotlib",
+    )
+    versions = {}
+    for package in packages:
+        try:
+            versions[package] = importlib_metadata.version(package)
+        except importlib_metadata.PackageNotFoundError:
+            versions[package] = None
+    return versions
+
+
 def write_environment(path: Path, config: Dict[str, Any], checkpoint_report: Dict[str, Any]) -> None:
     repo = Path(__file__).resolve().parents[1]
+    gpu_devices = []
+    if torch.cuda.is_available():
+        for index in range(torch.cuda.device_count()):
+            properties = torch.cuda.get_device_properties(index)
+            gpu_devices.append({
+                "index": index,
+                "name": properties.name,
+                "total_memory_bytes": int(properties.total_memory),
+                "compute_capability": f"{properties.major}.{properties.minor}",
+            })
+    slurm_environment = {
+        name: os.environ.get(name)
+        for name in (
+            "SLURM_JOB_ID", "SLURM_JOB_NAME", "SLURM_CLUSTER_NAME",
+            "SLURM_JOB_PARTITION", "SLURM_JOB_QOS", "SLURM_CPUS_PER_TASK",
+            "SLURM_MEM_PER_NODE", "SLURM_JOB_GPUS", "SLURM_GPUS_ON_NODE",
+        )
+        if os.environ.get(name) is not None
+    }
+    training = config.get("training", {})
     lines = {
         "command": " ".join(sys.argv),
         "git_commit": git_value(repo, "rev-parse", "HEAD"),
         "git_dirty": bool(git_value(repo, "status", "--porcelain")),
         "python": sys.version.replace("\n", " "),
         "platform": platform.platform(),
+        "operating_system": {
+            "system": platform.system(),
+            "release": platform.release(),
+            "version": platform.version(),
+        },
+        "cpu": {
+            "model": cpu_model(),
+            "logical_cores": os.cpu_count(),
+        },
+        "system_memory_bytes": system_memory_bytes(),
         "torch": torch.__version__,
         "cuda_runtime": torch.version.cuda,
         "cuda_available": torch.cuda.is_available(),
         "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
+        "gpu_devices": gpu_devices,
+        "packages": package_versions(),
+        "slurm": slurm_environment,
+        "reproducibility": {
+            "seed": training.get("seed"),
+            "deterministic_algorithms": bool(training.get("deterministic", False)),
+            "deterministic_warn_only": bool(training.get("deterministic_warn_only", False)),
+            "cublas_workspace_config": os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
+            "cudnn_benchmark": torch.backends.cudnn.benchmark,
+            "cudnn_deterministic": torch.backends.cudnn.deterministic,
+        },
         "checkpoint": checkpoint_report,
         "config_source": config.get("_config_path"),
     }
@@ -379,7 +459,11 @@ def main() -> int:
         training = config.get("training", {})
         model_config = config.get("model", {})
         seed = int(training.get("seed", 0))
-        set_seed(seed)
+        set_seed(
+            seed,
+            deterministic=bool(training.get("deterministic", False)),
+            warn_only=bool(training.get("deterministic_warn_only", False)),
+        )
         device = torch.device(training.get("device", "cuda"))
         if device.type == "cuda" and not torch.cuda.is_available():
             raise RuntimeError("CUDA was requested but is not available")

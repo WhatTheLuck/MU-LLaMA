@@ -9,6 +9,9 @@ from statistics import mean
 from typing import Any, Dict, List, Tuple
 
 
+BERTSCORE_MODEL_TYPE = "roberta-large"
+
+
 def evaluate_records(records: List[dict]) -> Tuple[Dict[str, Any], List[dict]]:
     augmented = [dict(record) for record in records]
     if not augmented:
@@ -71,7 +74,10 @@ def evaluate_records(records: List[dict]) -> Tuple[Dict[str, Any], List[dict]]:
     try:
         from bert_score import score as bert_score
 
-        precision, recall, f1 = bert_score(predictions, references, lang="en", verbose=False)
+        precision, recall, f1 = bert_score(
+            predictions, references, model_type=BERTSCORE_MODEL_TYPE,
+            lang="en", rescale_with_baseline=False, verbose=False,
+        )
         p_values = precision.detach().cpu().tolist()
         r_values = recall.detach().cpu().tolist()
         f_values = f1.detach().cpu().tolist()
@@ -83,6 +89,8 @@ def evaluate_records(records: List[dict]) -> Tuple[Dict[str, Any], List[dict]]:
             "bertscore_precision": mean(p_values),
             "bertscore_recall": mean(r_values),
             "bertscore_f1": mean(f_values),
+            "bertscore_model_type": BERTSCORE_MODEL_TYPE,
+            "bertscore_rescale_with_baseline": False,
         })
     except Exception as error:
         missing.append(f"BERTScore (bert-score/model): {error}")
@@ -110,4 +118,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

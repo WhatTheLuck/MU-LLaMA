@@ -50,6 +50,11 @@ HARMONY_KEYWORDS = (
     "harmony", "harmonic", "chord", "tonal", "tonality", "key", "mode",
     "dissonance", "consonance", "cadence", "interval", "pitch",
 )
+PAPER_PROVENANCE = (
+    Path(__file__).resolve().parents[1]
+    / "configs" / "experiments" / "paper_single_seed"
+    / "hyperparameter_provenance.yaml"
+)
 
 
 def read_json(path: Path) -> dict:
@@ -139,6 +144,11 @@ def paired_statistics(
     differences: np.ndarray, bootstrap_samples: int, seed: int,
     clusters: Optional[List[str]] = None,
 ) -> dict:
+    """Compute the preregistered paired uncertainty and significance evidence.
+
+    [Paper E2: statistical protocol] Formal runs aggregate question-level
+    differences per audio before bootstrap and Wilcoxon inference.
+    """
     if differences.size == 0:
         return {}
     bootstrap_values = differences
@@ -167,10 +177,82 @@ def paired_statistics(
         "paired_ci95_high": float(np.percentile(boot, 97.5)),
         "paired_bootstrap_p": p_value,
     }
+    try:
+        from scipy.stats import wilcoxon
+        if np.allclose(bootstrap_values, 0.0):
+            wilcoxon_p = 1.0
+        else:
+            wilcoxon_p = float(wilcoxon(
+                bootstrap_values, alternative="greater", zero_method="wilcox",
+                method="auto",
+            ).pvalue)
+        result["paired_wilcoxon_p_one_sided"] = wilcoxon_p
+    except (ImportError, ValueError) as error:
+        result["paired_wilcoxon_p_one_sided"] = None
+        result["paired_wilcoxon_error"] = str(error)
     if cluster_count is not None:
         result["bootstrap_clusters"] = cluster_count
         result["bootstrap_unit"] = "audio"
     return result
+
+
+def add_holm_adjustment(rows: List[dict], p_key: str, output_key: str) -> None:
+    eligible = [
+        (index, float(row[p_key]))
+        for index, row in enumerate(rows)
+        if isinstance(row.get(p_key), (int, float))
+    ]
+    ordered = sorted(eligible, key=lambda item: item[1])
+    running_max = 0.0
+    total = len(ordered)
+    for rank, (index, p_value) in enumerate(ordered):
+        running_max = max(running_max, min(1.0, (total - rank) * p_value))
+        rows[index][output_key] = running_max
+
+
+def write_paper_reproducibility_outputs(
+    report_root: Path,
+    names: List[str],
+    comparisons: List[Tuple[str, str]],
+    runs: Dict[str, dict],
+) -> None:
+    """Export the exact configurations and run evidence used by the paper."""
+    final_configs = {name: runs[name]["config"] for name in names}
+    (report_root / "paper_single_seed_final_configs.json").write_text(
+        json.dumps(final_configs, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    provenance = (
+        yaml.safe_load(PAPER_PROVENANCE.read_text(encoding="utf-8"))
+        if PAPER_PROVENANCE.is_file()
+        else {}
+    )
+    manifest = {
+        "protocol": "paper_single_seed",
+        "reported_runs_per_condition": 1,
+        "training_seed": 42,
+        "official_test_used_for_tuning": False,
+        "primary_metric": "bertscore_f1",
+        "statistical_unit": "audio",
+        "comparisons": [
+            {"left": left, "right": right} for left, right in comparisons
+        ],
+        "hyperparameter_provenance": provenance,
+        "runs": {
+            name: {
+                "run": str(runs[name]["path"]),
+                "completed": runs[name]["completed"],
+                "environment": runs[name]["environment"],
+                "parameter_summary": runs[name]["parameters"],
+                "data_split": runs[name]["split"],
+            }
+            for name in names
+        },
+    }
+    (report_root / "paper_single_seed_reproducibility_manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
 
 def write_summary(rows: List[dict], root: Path) -> None:
@@ -371,7 +453,9 @@ def main() -> int:
         config = resolved_config(run)
         runs[name] = {
             "path": run, "metrics": metrics, "predictions": predictions,
-            "evaluation": evaluation, "split": split,
+            "evaluation": evaluation, "split": split, "parameters": parameters,
+            "environment": environment, "config": config,
+            "completed": read_json(run / "completed.json"),
         }
         ds = config.get("model", {}).get("dissonance", {})
         temporal = ds.get("temporal", {})
@@ -418,6 +502,14 @@ def main() -> int:
     if args.paper_single_seed:
         baseline_keys = {prediction_key(record) for record in runs[args.baseline]["predictions"]}
         baseline_split = runs[args.baseline]["split"].get("splits")
+        for name in names:
+            if not runs[name]["predictions"] or not all(
+                isinstance(record.get("bertscore_f1"), (int, float))
+                for record in runs[name]["predictions"]
+            ):
+                raise RuntimeError(
+                    f"{name} lacks the preregistered primary metric BERTScore F1"
+                )
         for name in args.experiments:
             keys = {prediction_key(record) for record in runs[name]["predictions"]}
             if keys != baseline_keys:
@@ -429,6 +521,12 @@ def main() -> int:
                 raise RuntimeError(f"{name} uses a different train/validation/test partition")
     write_summary(rows, report_root)
     make_figures(report_root, args.baseline, args.experiments, runs)
+    if args.paper_single_seed:
+        # [Paper E3: reproducibility artifact] Bind every reported condition to
+        # its resolved config, split, environment, parameter count, and commit.
+        write_paper_reproducibility_outputs(
+            report_root, names, comparisons or [], runs
+        )
     if comparisons is not None:
         comparison_rows = []
         for comparison_index, (left, right) in enumerate(comparisons):
@@ -451,6 +549,23 @@ def main() -> int:
                         if args.paper_single_seed else None,
                     ),
                 })
+        if args.paper_single_seed:
+            overall_rows = [
+                row for row in comparison_rows if row.get("group") == "overall"
+            ]
+            add_holm_adjustment(
+                overall_rows, "paired_wilcoxon_p_one_sided",
+                "paired_wilcoxon_p_holm",
+            )
+            missing_tests = [
+                row["comparison"] for row in overall_rows
+                if not isinstance(row.get("paired_wilcoxon_p_holm"), (int, float))
+            ]
+            if missing_tests:
+                raise RuntimeError(
+                    "paper analysis requires valid Wilcoxon/Holm results for: "
+                    + ", ".join(missing_tests)
+                )
         with (report_root / f"{result_prefix}_comparisons.json").open("w", encoding="utf-8") as handle:
             json.dump(comparison_rows, handle, ensure_ascii=False, indent=2)
         if args.paper_single_seed:
@@ -473,13 +588,17 @@ def main() -> int:
                     "supported": (
                         isinstance(row.get("paired_ci95_low"), (int, float))
                         and row["paired_ci95_low"] > 0
+                        and isinstance(row.get("paired_wilcoxon_p_holm"), (int, float))
+                        and row["paired_wilcoxon_p_holm"] < 0.05
                     ),
                     "ci95": [row.get("paired_ci95_low"), row.get("paired_ci95_high")],
+                    "wilcoxon_p_holm": row.get("paired_wilcoxon_p_holm"),
                     "paired_samples": row.get("paired_samples"),
                 })
             claims_payload = {
                     "primary_rule": (
-                        "audio-clustered paired bootstrap 95% CI lower bound must be above zero"
+                        "audio-clustered paired bootstrap CI lower bound > 0 and "
+                        "one-sided paired Wilcoxon Holm-adjusted p < 0.05"
                     ),
                     "single_seed_limitation": (
                         "Sample-level uncertainty only; training-seed variability is not estimated."

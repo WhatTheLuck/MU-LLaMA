@@ -1,0 +1,78 @@
+scope: paper_single_seed
+policy:
+  official_test_used_for_tuning: false
+  selection_data: training logs, validation loss, token audit, and compute budget
+  reported_runs_per_condition: 1
+  reported_seed: 42
+
+development:
+  max_words:
+    values_audited: [128, 192, 256, 512]
+    selected: 256
+    criterion: zero truncation across FinetuneMusicQA and EvalMusicQA
+  epochs:
+    values_executed: [20, 4]
+    selected: 4
+    criterion: baseline validation optimum occurred at epoch 1 and 20 epochs exceeded the 48-hour limit
+  temporal_token_dim:
+    values_implemented: [256, 128]
+    completed_performance_trials_before_selection: []
+    selected: 128
+    criterion: selected from the parameter and time budget before any successful Stage 2 performance run
+  attention_dim:
+    values_implemented: [256, 128]
+    completed_performance_trials_before_selection: []
+    selected: 128
+    criterion: match temporal token width
+  temporal_conv_kernel:
+    values_tried: [3]
+    selected: 3
+    criterion: fixed lightweight local-context design
+  fusion_gate:
+    values_implemented: [sample_conditioned_scalar, learned_scalar]
+    completed_performance_trials_before_selection: []
+    selected: learned_scalar
+    criterion: one-parameter gate minimizes added capacity; selected before any successful Stage 2 performance run
+  early_stopping_patience:
+    values_tried: [2]
+    selected: 2
+    criterion: fixed before paper runs
+  batch_size:
+    values_tried: [1]
+    selected: 1
+    criterion: single-A100 memory limit
+  gradient_accumulation:
+    values_tried: [32]
+    selected: 32
+    criterion: effective batch size inherited from the established fine-tuning setup
+  precision:
+    values_tried: [bf16]
+    selected: bf16
+    criterion: A100 throughput and numerical range
+
+controlled_experimental_factors:
+  input_feature: [none, dissonance_spectrum, processed_cqt]
+  temporal_representation: [disabled, chronological, shuffled]
+  fusion_position: [pre_proj, post_bridge]
+
+fixed_optimization:
+  ds_encoder_lr: 1.0e-4
+  ds_temporal_lr: 1.0e-4
+  ds_fusion_lr: 1.0e-4
+  prefix_query_lr: 2.0e-5
+  bridge_norm_lr: 2.0e-5
+  weight_decay: 0.01
+  gradient_clip_norm: 1.0
+  warmup_ratio: 0.1
+  stage1_epochs: 1
+  stage2_epochs: 3
+
+evaluation:
+  primary_metric: bertscore_f1
+  bertscore_model: roberta-large
+  secondary_metrics: [bleu, meteor, rouge_l, test_loss, test_perplexity]
+  bootstrap_samples: 10000
+  bootstrap_unit: audio
+  significance_test: one-sided paired Wilcoxon signed-rank on per-audio mean differences
+  multiple_comparison_correction: Holm
+  alpha: 0.05

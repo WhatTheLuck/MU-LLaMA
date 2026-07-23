@@ -9,6 +9,8 @@ data:
   test_audio_root: ../MusicQA/audios
 training:
   seed: 42
+  deterministic: true
+  deterministic_warn_only: true
   epochs: 4
   save_every: 4
   precision: bf16

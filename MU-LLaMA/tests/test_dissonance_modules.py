@@ -234,6 +234,8 @@ class DissonanceModuleTest(unittest.TestCase):
             paper = load_config(paper_root / name)
             self.assertEqual(paper["training"]["seed"], 42)
             self.assertEqual(paper["training"]["epochs"], 4)
+            self.assertTrue(paper["training"]["deterministic"])
+            self.assertTrue(paper["training"]["deterministic_warn_only"])
             self.assertEqual(paper["model"]["max_words"], 256)
             self.assertEqual(paper["data"]["split_unit"], "audio")
             self.assertEqual(paper["data"]["validation_fraction"], 0.1)

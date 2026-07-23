@@ -28,6 +28,11 @@ def split_record_indices(
     seed: int,
     split_unit: str = "record",
 ) -> Dict[str, List[int]]:
+    """Create seeded splits without allowing an audio group to cross splits.
+
+    [Paper E1: evaluation protocol] Formal paper runs use ``split_unit=audio``
+    and a separate external test collection; the test set is never tuned on.
+    """
     if not 0.0 < validation_fraction < 1.0:
         raise ValueError("data.validation_fraction must be between 0 and 1")
     if not 0.0 <= test_fraction < 1.0:

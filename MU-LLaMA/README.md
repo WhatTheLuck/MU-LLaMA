@@ -1,5 +1,5 @@
 ---
-license: mit
+license: gpl-3.0
 tags:
 - music
 ---
@@ -85,3 +85,5 @@ python scripts/submit_paper_suite.py --cache-ready --slurm-config /path/to/runti
 ```
 
 The submitter packs two experiments into each of three parallel GPU jobs and submits one dependent CPU analysis job, staying within a four-job user quota. Analysis uses 10,000 audio-clustered paired bootstrap samples and writes claim-by-claim confidence intervals under `outputs/paper_single_seed/analysis/`. Existing minimal-screen results use a validation-only split and remain development evidence; they are not mixed into the paper table.
+
+See `../docs/reproducibility_checklist.md` for dataset provenance, exact metric definitions, the code-appendix index, infrastructure fields, hyperparameter provenance, and the manuscript checklist answers.

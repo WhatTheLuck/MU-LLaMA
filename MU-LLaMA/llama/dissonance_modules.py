@@ -125,7 +125,11 @@ def sinusoidal_positions(length: int, dimension: int, device, dtype) -> torch.Te
 
 
 class DSTemporalEncoder(nn.Module):
-    """Turn the CNN feature map into masked, ordered DS tokens."""
+    """Turn the CNN feature map into masked, ordered DS tokens.
+
+    [Paper M1: temporal DS representation] Frequency is pooled while the
+    chronologically ordered time axis is retained for local temporal modeling.
+    """
 
     def __init__(
         self,
@@ -168,6 +172,8 @@ class DSTemporalEncoder(nn.Module):
         tokens = self.input_projection(tokens)
         tokens = tokens * resized_mask.unsqueeze(-1).to(tokens.dtype)
         if self.order_mode == "shuffled":
+            # [Paper A1: order ablation] Apply a deterministic within-sample
+            # permutation while preserving token values and valid-token counts.
             shuffled = tokens.clone()
             for sample_index, sample_mask in enumerate(resized_mask):
                 valid_indices = sample_mask.nonzero(as_tuple=False).flatten()
@@ -258,7 +264,11 @@ class GatedResidualFusion(nn.Module):
 
 
 class TemporalGatedAttentionFusion(nn.Module):
-    """Single-query masked attention followed by a zero-init gated residual."""
+    """Single-query masked attention followed by a zero-init gated residual.
+
+    [Paper M2: post-bridge fusion] The MERT-derived bridge embedding queries
+    DS tokens, then a learned scalar gate adds the attended residual.
+    """
 
     def __init__(
         self,
