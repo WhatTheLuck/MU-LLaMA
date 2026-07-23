@@ -1,0 +1,6 @@
+base:
+  - ../09_ds_staged_global.yaml
+  - paper_common.yaml
+training:
+  stage1_epochs: 1
+  stage2_epochs: 3

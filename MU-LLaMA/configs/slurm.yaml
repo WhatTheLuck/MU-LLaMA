@@ -11,6 +11,7 @@ cluster:
   time: "24:00:00"
   stage2_time: "40:00:00"
   minimal_time: "30:00:00"
+  paper_group_time: "47:30:00"
   gres: gpu:a100:1
   python_executable: python
   conda_env: null

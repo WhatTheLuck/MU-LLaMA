@@ -64,3 +64,24 @@ python scripts/submit_minimal_screen.py --max-words 256
 ```
 
 If it fails, omit `--max-words 256`; the safe default is 512. The DAG starts the DS cache, CQT cache, and baseline independently; 10/11 wait only for the DS cache, 12 waits only for the CQT cache, and analysis joins all four completed training jobs.
+
+### Single-seed paper suite
+
+The paper suite runs `00/09/10/11/12/13` with seed 42. Config `13` is a parameter-matched deterministic temporal-order shuffle. FinetuneMusicQA is split into audio-grouped 90/10 train/validation partitions, and the repository's separate EvalMusicQA set is used only for final testing. Validation selects the best checkpoint; only the untouched official evaluation set supplies paper metrics.
+
+First extend the existing DS and CQT caches to EvalMusicQA and audit both datasets:
+
+```bash
+python scripts/submit_paper_suite.py --cache-only --slurm-config /path/to/runtime/slurm.yaml --dry-run
+python scripts/submit_paper_suite.py --cache-only --slurm-config /path/to/runtime/slurm.yaml
+python tools/audit_token_lengths.py --config configs/experiments/paper_single_seed/00_baseline_peft.yaml --require-max-words 256 --output outputs/paper_single_seed/token_length_audit.json
+```
+
+After both cache jobs complete successfully, preview and submit:
+
+```bash
+python scripts/submit_paper_suite.py --cache-ready --slurm-config /path/to/runtime/slurm.yaml --dry-run
+python scripts/submit_paper_suite.py --cache-ready --slurm-config /path/to/runtime/slurm.yaml
+```
+
+The submitter packs two experiments into each of three parallel GPU jobs and submits one dependent CPU analysis job, staying within a four-job user quota. Analysis uses 10,000 audio-clustered paired bootstrap samples and writes claim-by-claim confidence intervals under `outputs/paper_single_seed/analysis/`. Existing minimal-screen results use a validation-only split and remain development evidence; they are not mixed into the paper table.

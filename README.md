@@ -27,6 +27,8 @@ The operational Stage 2 scheduler uses separate 6-epoch budget overlays after an
 
 For a faster first decision, `MU-LLaMA/scripts/submit_minimal_screen.py` runs only 00/10/11/12 as a parallel DAG with 4-epoch overlays and a lightweight learned-scalar temporal gate. A token-length audit must approve any sequence reduction below 512.
 
+For the final resource-limited paper table, `MU-LLaMA/scripts/submit_paper_suite.py` runs the six controlled conditions 00/09/10/11/12/13 on a leakage-free audio-grouped held-out test split. It packs them into three two-experiment GPU allocations plus one analysis allocation to respect a four-job Slurm submission cap.
+
 The demo page with more information regarding the MU-LLaMA model is avilable [here](https://crypto-code.github.io/MU-LLaMA-Demo/).
 
 ## Introduction

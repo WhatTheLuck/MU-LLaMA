@@ -134,14 +134,20 @@ class DSTemporalEncoder(nn.Module):
         conv_kernel: int = 5,
         dropout: float = 0.1,
         positional_encoding: str = "sinusoidal",
+        order_mode: str = "chronological",
+        shuffle_seed: int = 0,
     ):
         super().__init__()
         if conv_kernel < 1 or conv_kernel % 2 == 0:
             raise ValueError("temporal.conv_kernel must be a positive odd integer")
         if positional_encoding not in {"sinusoidal", "none"}:
             raise ValueError("temporal.positional_encoding must be sinusoidal or none")
+        if order_mode not in {"chronological", "shuffled"}:
+            raise ValueError("temporal.order_mode must be chronological or shuffled")
         self.token_dim = int(token_dim)
         self.positional_encoding = positional_encoding
+        self.order_mode = order_mode
+        self.shuffle_seed = int(shuffle_seed)
         self.input_projection = nn.Linear(int(input_dim), self.token_dim)
         self.depthwise = nn.Conv1d(
             self.token_dim, self.token_dim, int(conv_kernel),
@@ -161,6 +167,20 @@ class DSTemporalEncoder(nn.Module):
         tokens = feature_map.mean(dim=2).transpose(1, 2)
         tokens = self.input_projection(tokens)
         tokens = tokens * resized_mask.unsqueeze(-1).to(tokens.dtype)
+        if self.order_mode == "shuffled":
+            shuffled = tokens.clone()
+            for sample_index, sample_mask in enumerate(resized_mask):
+                valid_indices = sample_mask.nonzero(as_tuple=False).flatten()
+                generator = torch.Generator(device="cpu").manual_seed(
+                    self.shuffle_seed + int(valid_indices.numel())
+                )
+                permutation = torch.randperm(
+                    int(valid_indices.numel()), generator=generator, device="cpu"
+                ).to(valid_indices.device)
+                shuffled[sample_index, valid_indices] = tokens[
+                    sample_index, valid_indices[permutation]
+                ]
+            tokens = shuffled
         if self.positional_encoding == "sinusoidal":
             tokens = tokens + sinusoidal_positions(
                 tokens.shape[1], tokens.shape[2], tokens.device, tokens.dtype
@@ -180,6 +200,8 @@ def build_ds_temporal_encoder(config: Dict, input_dim: int = 128) -> Optional[DS
         conv_kernel=int(config.get("conv_kernel", 5)),
         dropout=float(config.get("dropout", 0.1)),
         positional_encoding=config.get("positional_encoding", "sinusoidal"),
+        order_mode=config.get("order_mode", "chronological"),
+        shuffle_seed=int(config.get("shuffle_seed", 0)),
     )
 
 

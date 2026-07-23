@@ -31,6 +31,7 @@ from data.dataset import FinetuneDataset, finetune_collate, transform_train
 from engine_finetune import train_one_epoch
 from llama.llama_adapter import LLaMA_adapter
 from util.config import config_fingerprint, dump_config, load_config
+from util.data_split import split_manifest, split_record_indices
 
 
 class Tee:
@@ -193,19 +194,6 @@ def parameter_groups(model: torch.nn.Module, config: Dict[str, Any]) -> Tuple[Li
     return optimizer_groups, summary
 
 
-def split_dataset(dataset, validation_fraction: float, seed: int):
-    if not 0.0 < validation_fraction < 1.0:
-        raise ValueError("data.validation_fraction must be between 0 and 1")
-    generator = torch.Generator().manual_seed(seed)
-    order = torch.randperm(len(dataset), generator=generator).tolist()
-    validation_size = max(1, int(round(len(order) * validation_fraction)))
-    validation = order[:validation_size]
-    training = order[validation_size:]
-    if not training:
-        raise ValueError("Dataset is too small for the requested validation split")
-    return Subset(dataset, training), Subset(dataset, validation)
-
-
 def move_batch(batch, device):
     examples, labels, masks, audio, extras = batch
     ds = extras.get("dissonance")
@@ -240,7 +228,10 @@ def stable_generation_seed(base_seed: int, question_id: str) -> int:
     return (base_seed + suffix) % (2 ** 31)
 
 
-def evaluate_loader(model, loader, device, config, generate_predictions=False, smoke_test=False):
+def evaluate_loader(
+    model, loader, device, config, generate_predictions=False, smoke_test=False,
+    metric_prefix="val",
+):
     model.eval()
     total_loss = 0.0
     sample_count = 0
@@ -310,9 +301,9 @@ def evaluate_loader(model, loader, device, config, generate_predictions=False, s
                 predictions.append(record)
     mean_loss = total_loss / max(1, sample_count)
     return {
-        "val_loss": mean_loss,
-        "val_perplexity": math.exp(min(20.0, mean_loss)),
-        "validation_samples": sample_count,
+        f"{metric_prefix}_loss": mean_loss,
+        f"{metric_prefix}_perplexity": math.exp(min(20.0, mean_loss)),
+        f"{metric_prefix}_samples": sample_count,
     }, predictions
 
 
@@ -448,10 +439,55 @@ def main() -> int:
             audio_root=data_config.get("audio_root", "../MusicQA/audios"),
             dissonance_config=model_config.get("dissonance"), return_metadata=True,
         )
-        train_dataset, validation_dataset = split_dataset(
-            dataset, float(data_config.get("validation_fraction", 0.1)),
-            int(data_config.get("split_seed", seed)),
+        validation_fraction = float(data_config.get("validation_fraction", 0.1))
+        test_fraction = float(data_config.get("test_fraction", 0.0))
+        split_seed = int(data_config.get("split_seed", seed))
+        split_unit = str(data_config.get("split_unit", "record"))
+        test_config = data_config.get("test_config")
+        if "split_unit" not in data_config and not test_config and test_fraction == 0:
+            # Preserve the historical record-level torch.randperm split exactly.
+            generator = torch.Generator().manual_seed(split_seed)
+            order = torch.randperm(len(dataset), generator=generator).tolist()
+            validation_size = max(1, int(round(len(order) * validation_fraction)))
+            split_indices = {
+                "train": order[validation_size:],
+                "validation": order[:validation_size],
+                "test": [],
+            }
+            if not split_indices["train"]:
+                raise ValueError("Dataset is too small for the requested validation split")
+        else:
+            split_indices = split_record_indices(
+                dataset.ann, validation_fraction, test_fraction, split_seed, split_unit,
+            )
+        train_dataset = Subset(dataset, split_indices["train"])
+        validation_dataset = Subset(dataset, split_indices["validation"])
+        if test_config:
+            if test_fraction > 0:
+                raise ValueError("Use either data.test_config or data.test_fraction, not both")
+            test_dataset = FinetuneDataset(
+                test_config, transform=transform_train,
+                max_words=int(model_config.get("max_words", 512)),
+                tokenizer_path=str(tokenizer_path),
+                audio_root=data_config.get(
+                    "test_audio_root", data_config.get("audio_root", "../MusicQA/audios")
+                ),
+                dissonance_config=model_config.get("dissonance"), return_metadata=True,
+            )
+        else:
+            test_dataset = (
+                Subset(dataset, split_indices["test"]) if split_indices["test"] else None
+            )
+        manifest = split_manifest(
+            dataset.ann, split_indices, split_unit, split_seed,
+            validation_fraction, test_fraction,
+            external_test_records=test_dataset.ann
+            if test_config and hasattr(test_dataset, "ann") else None,
         )
+        (output_dir / "data_split.json").write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        print(json.dumps({"data_split": manifest}, ensure_ascii=False))
         loader_kwargs = {
             "num_workers": int(data_config.get("num_workers", 4)),
             "pin_memory": bool(data_config.get("pin_memory", True)),
@@ -462,6 +498,10 @@ def main() -> int:
             drop_last=True, generator=torch.Generator().manual_seed(seed), **loader_kwargs,
         )
         validation_loader = DataLoader(validation_dataset, batch_size=1, shuffle=False, **loader_kwargs)
+        test_loader = (
+            DataLoader(test_dataset, batch_size=1, shuffle=False, **loader_kwargs)
+            if test_dataset is not None else None
+        )
         writer = SummaryWriter(log_dir=output_dir / "tensorboard")
 
         configured_epochs = int(training.get(
@@ -562,9 +602,12 @@ def main() -> int:
             except TypeError:
                 best_state = torch.load(best_checkpoint, map_location="cpu")
             model.load_state_dict(best_state["model"], strict=True)
+        evaluation_split = "test" if test_loader is not None else "validation"
+        final_loader = test_loader if test_loader is not None else validation_loader
         final_validation, final_predictions = evaluate_loader(
-            model, validation_loader, device, config,
+            model, final_loader, device, config,
             generate_predictions=True, smoke_test=args.smoke_test,
+            metric_prefix="test" if test_loader is not None else "val",
         )
         final_evaluation, final_predictions = automatic_evaluation(final_predictions)
         final_evaluation.update(final_validation)
@@ -572,6 +615,7 @@ def main() -> int:
             "best_epoch": best_epoch,
             "best_val_loss": best_val_loss,
             "stopped_early": stopped_early,
+            "evaluation_split": evaluation_split,
         })
 
         with (output_dir / "predictions.jsonl").open("w", encoding="utf-8") as handle:
@@ -595,6 +639,8 @@ def main() -> int:
             "experiment": config.get("experiment", {}).get("name"),
             "seed": seed,
             "split_seed": data_config.get("split_seed", seed),
+            "split_unit": split_unit,
+            "test_fraction": test_fraction,
             "pretrained_path": str(checkpoint_path),
             "max_words": int(model_config.get("max_words", 512)),
             "best_epoch": best_epoch,

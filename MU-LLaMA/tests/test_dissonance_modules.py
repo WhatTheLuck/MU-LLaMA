@@ -101,6 +101,16 @@ class DissonanceModuleTest(unittest.TestCase):
         self.assertTrue(torch.allclose(tokens_clean[0], tokens_dirty[0], atol=1e-5))
         reversed_tokens, _ = temporal(encoder.extract_feature_map(clean.flip(-1)), mask.flip(-1))
         self.assertFalse(torch.allclose(tokens_clean[1], reversed_tokens[1]))
+        shuffled_temporal = DSTemporalEncoder(
+            input_dim=128, token_dim=32, conv_kernel=5, dropout=0.0,
+            order_mode="shuffled", shuffle_seed=42,
+        )
+        shuffled_temporal.load_state_dict(temporal.state_dict(), strict=True)
+        shuffled_tokens, shuffled_mask = shuffled_temporal(
+            encoder.extract_feature_map(clean * mask[:, None, :]), mask
+        )
+        self.assertTrue(torch.equal(token_mask, shuffled_mask))
+        self.assertFalse(torch.allclose(tokens_clean, shuffled_tokens))
 
         fusion = TemporalGatedAttentionFusion(base_dim=64, token_dim=32, attention_dim=16)
         base = torch.randn(2, 64)
@@ -212,6 +222,28 @@ class DissonanceModuleTest(unittest.TestCase):
                 self.assertEqual(ds["temporal"]["token_dim"], 128)
                 self.assertEqual(ds["fusion"]["attention_dim"], 128)
                 self.assertEqual(ds["fusion"]["gate"], "learned_scalar")
+
+        paper_root = config_root / "paper_single_seed"
+        paper_names = (
+            "00_baseline_peft.yaml", "09_ds_staged_global.yaml",
+            "10_ds_temporal_pre_proj.yaml", "11_ds_temporal_post_bridge.yaml",
+            "12_cqt_temporal_post_bridge.yaml",
+            "13_ds_temporal_shuffled_post_bridge.yaml",
+        )
+        for name in paper_names:
+            paper = load_config(paper_root / name)
+            self.assertEqual(paper["training"]["seed"], 42)
+            self.assertEqual(paper["training"]["epochs"], 4)
+            self.assertEqual(paper["model"]["max_words"], 256)
+            self.assertEqual(paper["data"]["split_unit"], "audio")
+            self.assertEqual(paper["data"]["validation_fraction"], 0.1)
+            self.assertEqual(paper["data"]["test_fraction"], 0.0)
+            self.assertEqual(paper["data"]["test_config"], "configs/eval.yaml")
+            self.assertEqual(paper["output"]["root"], "outputs/paper_single_seed")
+        shuffled = load_config(paper_root / "13_ds_temporal_shuffled_post_bridge.yaml")
+        self.assertEqual(
+            shuffled["model"]["dissonance"]["temporal"]["order_mode"], "shuffled"
+        )
 
         common = {"enabled": True, "cache_root": tempfile.mkdtemp(), "feature": {
             "n_octaves": 2, "bins_per_octave": 12,

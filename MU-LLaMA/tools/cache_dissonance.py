@@ -39,53 +39,60 @@ def main() -> int:
     adapter = DissonanceFeatureAdapter(ds_config)
     if not adapter.enabled:
         raise ValueError("Caching requires model.dissonance.enabled=true")
-    data_config = config.get("data", {}).get("train_config")
-    audio_root = config.get("data", {}).get("audio_root", "../MusicQA/audios")
+    data = config.get("data", {})
+    data_config = data.get("train_config")
+    audio_root = data.get("audio_root", "../MusicQA/audios")
     if not data_config:
         raise ValueError("data.train_config is required")
+    sources = [(data_config, audio_root)]
+    if data.get("test_config"):
+        sources.append((
+            data["test_config"], data.get("test_audio_root", audio_root)
+        ))
 
     failures_path = adapter.cache_dir / "failures.jsonl"
     manifest_path = adapter.cache_dir / "manifest.jsonl"
     processed = skipped = failed = visited = 0
     seen = set()
-    for audio_id, audio_path, _ in iter_audio_records(data_config, audio_root):
-        identity = str(audio_path)
-        if identity in seen:
-            continue
-        seen.add(identity)
-        if args.limit is not None and visited >= args.limit:
-            break
-        visited += 1
-        target = adapter.cache_path(audio_id, audio_path)
-        if target.is_file() and not args.force:
-            try:
-                adapter.validate(load_tensor_file(target))
-                skipped += 1
-                print(f"skip {audio_id}: {target}")
+    for source_config, source_audio_root in sources:
+        for audio_id, audio_path, _ in iter_audio_records(source_config, source_audio_root):
+            identity = str(audio_path)
+            if identity in seen:
                 continue
+            seen.add(identity)
+            if args.limit is not None and visited >= args.limit:
+                break
+            visited += 1
+            target = adapter.cache_path(audio_id, audio_path)
+            if target.is_file() and not args.force:
+                try:
+                    adapter.validate(load_tensor_file(target))
+                    skipped += 1
+                    print(f"skip {audio_id}: {target}")
+                    continue
+                except Exception as error:
+                    print(f"rebuild invalid cache {target}: {error}")
+            try:
+                payload = adapter.compute(audio_id, audio_path)
+                saved = adapter.save(payload, audio_id, audio_path)
+                processed += 1
+                _append_jsonl(manifest_path, {
+                    "audio_id": audio_id,
+                    "audio_path": str(audio_path),
+                    "cache_path": str(saved),
+                    "shape": list(payload[adapter.tensor_key].shape),
+                    "metadata": payload["metadata"],
+                })
+                print(f"cached {audio_id}: {tuple(payload[adapter.tensor_key].shape)} -> {saved}")
             except Exception as error:
-                print(f"rebuild invalid cache {target}: {error}")
-        try:
-            payload = adapter.compute(audio_id, audio_path)
-            saved = adapter.save(payload, audio_id, audio_path)
-            processed += 1
-            _append_jsonl(manifest_path, {
-                "audio_id": audio_id,
-                "audio_path": str(audio_path),
-                "cache_path": str(saved),
-                "shape": list(payload[adapter.tensor_key].shape),
-                "metadata": payload["metadata"],
-            })
-            print(f"cached {audio_id}: {tuple(payload[adapter.tensor_key].shape)} -> {saved}")
-        except Exception as error:
-            failed += 1
-            _append_jsonl(failures_path, {
-                "audio_id": audio_id,
-                "audio_path": str(audio_path),
-                "error": repr(error),
-                "traceback": traceback.format_exc(),
-            })
-            print(f"failed {audio_id}: {error}", file=sys.stderr)
+                failed += 1
+                _append_jsonl(failures_path, {
+                    "audio_id": audio_id,
+                    "audio_path": str(audio_path),
+                    "error": repr(error),
+                    "traceback": traceback.format_exc(),
+                })
+                print(f"failed {audio_id}: {error}", file=sys.stderr)
 
     print(json.dumps({
         "cache_dir": str(adapter.cache_dir),

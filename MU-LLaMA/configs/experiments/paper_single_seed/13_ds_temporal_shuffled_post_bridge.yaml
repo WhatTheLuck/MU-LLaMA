@@ -1,0 +1,8 @@
+base: 11_ds_temporal_post_bridge.yaml
+experiment:
+  name: 13_ds_temporal_shuffled_post_bridge
+model:
+  dissonance:
+    temporal:
+      order_mode: shuffled
+      shuffle_seed: 42

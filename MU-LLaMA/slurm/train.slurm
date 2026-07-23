@@ -17,6 +17,8 @@ if [[ "$TASK_KIND" == "train" ]]; then
   CONFIG_PATH="${1:?experiment config path is required}"
   shift
   "$PYTHON_BIN" train.py --config "$CONFIG_PATH" "$@"
+elif [[ "$TASK_KIND" == "group" ]]; then
+  "$PYTHON_BIN" scripts/run_experiment_group.py "$@"
 elif [[ "$TASK_KIND" == "analyze" ]]; then
   "$PYTHON_BIN" scripts/analyze_results.py "$@"
 else

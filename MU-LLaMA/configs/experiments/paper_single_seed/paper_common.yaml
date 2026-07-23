@@ -1,0 +1,20 @@
+model:
+  max_words: 256
+data:
+  validation_fraction: 0.1
+  test_fraction: 0.0
+  split_unit: audio
+  split_seed: 42
+  test_config: configs/eval.yaml
+  test_audio_root: ../MusicQA/audios
+training:
+  seed: 42
+  epochs: 4
+  save_every: 4
+  precision: bf16
+  early_stopping:
+    patience: 2
+generation:
+  seed: 42
+output:
+  root: outputs/paper_single_seed

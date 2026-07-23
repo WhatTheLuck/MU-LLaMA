@@ -53,21 +53,26 @@ def main() -> int:
     llama_root = Path(config["model"]["llama_path"])
     tokenizer_path = resolve_path(llama_root / "tokenizer.model", PROJECT_ROOT)
     processor = spm.SentencePieceProcessor(model_file=str(tokenizer_path))
-    data_config_path = resolve_path(config["data"]["train_config"], PROJECT_ROOT)
-    data_config = load_config(data_config_path)
-
     lengths = []
-    for meta_ref in data_config.get("META", []):
-        meta_path = resolve_path(meta_ref, data_config_path.parent)
-        records = json.loads(meta_path.read_text(encoding="utf-8"))
-        for record in records:
-            conversation = record.get("conversation") or []
-            if len(conversation) < 2:
-                continue
-            question = str(conversation[0].get("value", ""))
-            answer = str(conversation[1].get("value", ""))
-            prompt = PROMPT_TEMPLATE.format_map({"instruction": question, "input": input})
-            lengths.append(len(processor.encode(prompt + answer)) + 2)  # BOS + EOS
+    data_config_paths = []
+    for key in ("train_config", "test_config"):
+        value = config.get("data", {}).get(key)
+        if not value:
+            continue
+        data_config_path = resolve_path(value, PROJECT_ROOT)
+        data_config_paths.append(data_config_path)
+        data_config = load_config(data_config_path)
+        for meta_ref in data_config.get("META", []):
+            meta_path = resolve_path(meta_ref, data_config_path.parent)
+            records = json.loads(meta_path.read_text(encoding="utf-8"))
+            for record in records:
+                conversation = record.get("conversation") or []
+                if len(conversation) < 2:
+                    continue
+                question = str(conversation[0].get("value", ""))
+                answer = str(conversation[1].get("value", ""))
+                prompt = PROMPT_TEMPLATE.format_map({"instruction": question, "input": input})
+                lengths.append(len(processor.encode(prompt + answer)) + 2)  # BOS + EOS
     if not lengths:
         raise RuntimeError("No question-answer records were found for token auditing")
 
@@ -82,7 +87,8 @@ def main() -> int:
     passing = [int(value) for value, result in candidates.items() if result["passes"]]
     report = {
         "config_source": config.get("_config_path"),
-        "data_config": str(data_config_path),
+        "data_configs": [str(path) for path in data_config_paths],
+        "includes_test_config": bool(config.get("data", {}).get("test_config")),
         "tokenizer_path": str(tokenizer_path),
         "samples": len(lengths),
         "min": min(lengths),

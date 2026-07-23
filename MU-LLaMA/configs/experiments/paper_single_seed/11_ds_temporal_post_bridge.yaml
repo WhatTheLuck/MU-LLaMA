@@ -1,0 +1,3 @@
+base:
+  - ../stage2_minimal_screen/11_ds_temporal_post_bridge.yaml
+  - paper_common.yaml

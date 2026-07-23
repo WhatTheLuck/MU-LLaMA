@@ -32,6 +32,20 @@ MINIMAL_STAGE2_COMPARISONS = [
     ("10_ds_temporal_pre_proj", "11_ds_temporal_post_bridge"),
     ("11_ds_temporal_post_bridge", "12_cqt_temporal_post_bridge"),
 ]
+PAPER_SINGLE_SEED_EXPERIMENTS = [
+    "09_ds_staged_global",
+    "10_ds_temporal_pre_proj",
+    "11_ds_temporal_post_bridge",
+    "12_cqt_temporal_post_bridge",
+    "13_ds_temporal_shuffled_post_bridge",
+]
+PAPER_SINGLE_SEED_COMPARISONS = [
+    ("00_baseline_peft", "11_ds_temporal_post_bridge"),
+    ("09_ds_staged_global", "10_ds_temporal_pre_proj"),
+    ("10_ds_temporal_pre_proj", "11_ds_temporal_post_bridge"),
+    ("12_cqt_temporal_post_bridge", "11_ds_temporal_post_bridge"),
+    ("13_ds_temporal_shuffled_post_bridge", "11_ds_temporal_post_bridge"),
+]
 HARMONY_KEYWORDS = (
     "harmony", "harmonic", "chord", "tonal", "tonality", "key", "mode",
     "dissonance", "consonance", "cadence", "interval", "pitch",
@@ -55,7 +69,16 @@ def latest_run(root: Path, experiment: str, seed: Optional[int] = None) -> Optio
         if not seed_dir.is_dir():
             continue
         candidates.extend(path for path in seed_dir.glob("run_*") if path.is_dir())
-    valid = [path for path in candidates if (path / "metrics.jsonl").is_file()]
+    valid = []
+    for path in candidates:
+        marker = read_json(path / "completed.json")
+        complete = marker.get("status") == "completed"
+        legacy_complete = all(
+            (path / name).is_file()
+            for name in ("metrics.jsonl", "predictions.jsonl", "evaluation.json")
+        )
+        if complete or legacy_complete:
+            valid.append(path)
     return max(valid, key=lambda path: path.stat().st_mtime) if valid else None
 
 
@@ -84,7 +107,7 @@ def subgroup_metrics(records: List[dict], group: str) -> dict:
         "METEOR": mean_metric(selected, "meteor"),
         "ROUGE-L": mean_metric(selected, "rouge_l"),
         "BERTScore": mean_metric(selected, "bertscore_f1"),
-        "val_loss": mean_metric(selected, "sample_loss"),
+        "evaluation_loss": mean_metric(selected, "sample_loss"),
     }
 
 
@@ -112,29 +135,49 @@ def paired_metric(baseline: List[dict], experiment: List[dict]) -> Tuple[Optiona
     return None, np.asarray([]), []
 
 
-def paired_statistics(differences: np.ndarray, bootstrap_samples: int, seed: int) -> dict:
+def paired_statistics(
+    differences: np.ndarray, bootstrap_samples: int, seed: int,
+    clusters: Optional[List[str]] = None,
+) -> dict:
     if differences.size == 0:
         return {}
+    bootstrap_values = differences
+    cluster_count = None
+    if clusters:
+        grouped = {}
+        for cluster, difference in zip(clusters, differences):
+            grouped.setdefault(str(cluster), []).append(float(difference))
+        bootstrap_values = np.asarray([
+            np.mean(grouped[name]) for name in sorted(grouped)
+        ], dtype=float)
+        cluster_count = int(bootstrap_values.size)
     rng = np.random.default_rng(seed)
     boot = np.empty(bootstrap_samples, dtype=float)
     for index in range(bootstrap_samples):
-        boot[index] = rng.choice(differences, size=differences.size, replace=True).mean()
+        boot[index] = rng.choice(
+            bootstrap_values, size=bootstrap_values.size, replace=True
+        ).mean()
     p_value = min(1.0, 2.0 * min(float((boot <= 0).mean()), float((boot >= 0).mean())))
-    return {
+    result = {
         "paired_samples": int(differences.size),
-        "paired_mean_difference": float(differences.mean()),
-        "paired_median_difference": float(np.median(differences)),
-        "paired_improved_fraction": float((differences > 0).mean()),
+        "paired_mean_difference": float(bootstrap_values.mean()),
+        "paired_median_difference": float(np.median(bootstrap_values)),
+        "paired_improved_fraction": float((bootstrap_values > 0).mean()),
         "paired_ci95_low": float(np.percentile(boot, 2.5)),
         "paired_ci95_high": float(np.percentile(boot, 97.5)),
         "paired_bootstrap_p": p_value,
     }
+    if cluster_count is not None:
+        result["bootstrap_clusters"] = cluster_count
+        result["bootstrap_unit"] = "audio"
+    return result
 
 
 def write_summary(rows: List[dict], root: Path) -> None:
     preferred = [
         "experiment", "group", "feature_type", "temporal_enabled", "fusion_type", "position",
-        "trainable_parameters", "best_epoch", "val_loss", "BLEU", "METEOR", "ROUGE-L",
+        "trainable_parameters", "best_epoch", "evaluation_split", "evaluation_loss",
+        "val_loss", "test_loss", "BLEU", "METEOR", "ROUGE-L",
         "BERTScore", "runtime", "peak_GPU", "samples", "run",
     ]
     available = {key for row in rows for key in row}
@@ -180,7 +223,10 @@ def make_figures(root: Path, baseline: str, experiments: List[str], runs: Dict[s
         no_data(axes[0], "No real loss records"); no_data(axes[1], "No real loss records")
     fig.tight_layout(); fig.savefig(figures / "01_loss_curves.png", dpi=180); plt.close(fig)
 
-    metric_names = ["bleu", "meteor", "rouge_l", "bertscore_f1", "val_loss", "val_perplexity"]
+    metric_names = [
+        "bleu", "meteor", "rouge_l", "bertscore_f1",
+        "test_loss", "test_perplexity", "val_loss", "val_perplexity",
+    ]
     available = [metric for metric in metric_names if any(
         isinstance(runs.get(name, {}).get("evaluation", {}).get(metric), (int, float)) for name in names
     )]
@@ -261,14 +307,16 @@ def main() -> int:
     parser.add_argument("--experiments", nargs="+")
     parser.add_argument("--stage2", action="store_true")
     parser.add_argument("--minimal-stage2", action="store_true")
+    parser.add_argument("--paper-single-seed", action="store_true")
     parser.add_argument("--bootstrap-samples", type=int, default=2000)
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
-    if args.stage2 and args.minimal_stage2:
-        parser.error("--stage2 and --minimal-stage2 are mutually exclusive")
+    if sum((args.stage2, args.minimal_stage2, args.paper_single_seed)) > 1:
+        parser.error("--stage2, --minimal-stage2, and --paper-single-seed are mutually exclusive")
     comparisons = None
     result_prefix = None
     followup_controls = None
+    require_test_split = False
     if args.stage2:
         args.baseline = "00_baseline_peft"
         args.experiments = STAGE2_EXPERIMENTS
@@ -283,6 +331,17 @@ def main() -> int:
         followup_controls = [
             "00_baseline_peft", "10_ds_temporal_pre_proj", "12_cqt_temporal_post_bridge",
         ]
+    elif args.paper_single_seed:
+        args.baseline = "00_baseline_peft"
+        args.experiments = PAPER_SINGLE_SEED_EXPERIMENTS
+        comparisons = PAPER_SINGLE_SEED_COMPARISONS
+        result_prefix = "paper_single_seed"
+        followup_controls = [
+            "00_baseline_peft", "09_ds_staged_global",
+            "10_ds_temporal_pre_proj", "12_cqt_temporal_post_bridge",
+            "13_ds_temporal_shuffled_post_bridge",
+        ]
+        require_test_split = True
     if not args.baseline or not args.experiments:
         parser.error("--baseline and --experiments are required unless --stage2 is used")
     args.root.mkdir(parents=True, exist_ok=True)
@@ -300,10 +359,20 @@ def main() -> int:
         metrics = read_jsonl(run / "metrics.jsonl")
         predictions = read_jsonl(run / "predictions.jsonl")
         evaluation = read_json(run / "evaluation.json")
+        split = read_json(run / "data_split.json")
+        if require_test_split:
+            if evaluation.get("evaluation_split") != "test":
+                raise RuntimeError(f"{name} was not evaluated on the held-out test split")
+            overlap = split.get("group_overlap", {})
+            if not overlap or any(int(value) != 0 for value in overlap.values()):
+                raise RuntimeError(f"{name} does not prove leakage-free grouped splits: {overlap}")
         parameters = read_json(run / "parameter_summary.json")
         environment = read_json(run / "environment.txt")
         config = resolved_config(run)
-        runs[name] = {"path": run, "metrics": metrics, "predictions": predictions, "evaluation": evaluation}
+        runs[name] = {
+            "path": run, "metrics": metrics, "predictions": predictions,
+            "evaluation": evaluation, "split": split,
+        }
         ds = config.get("model", {}).get("dissonance", {})
         temporal = ds.get("temporal", {})
         fusion = ds.get("fusion", {})
@@ -320,6 +389,7 @@ def main() -> int:
             "position": fusion.get("position", "none") if enabled else "none",
             "trainable_parameters": parameters.get("trainable_parameters"),
             "best_epoch": best_epoch,
+            "evaluation_split": evaluation.get("evaluation_split", "validation"),
             "runtime": environment.get("training_duration_seconds"),
             "peak_GPU": environment.get("peak_gpu_memory_mb"),
         }
@@ -331,7 +401,11 @@ def main() -> int:
                     "METEOR": evaluation.get("meteor", aggregate["METEOR"]),
                     "ROUGE-L": evaluation.get("rouge_l", aggregate["ROUGE-L"]),
                     "BERTScore": evaluation.get("bertscore_f1", aggregate["BERTScore"]),
-                    "val_loss": evaluation.get("val_loss", aggregate["val_loss"]),
+                    "evaluation_loss": evaluation.get(
+                        "test_loss", evaluation.get("val_loss", aggregate["evaluation_loss"])
+                    ),
+                    "val_loss": evaluation.get("val_loss"),
+                    "test_loss": evaluation.get("test_loss"),
                 })
             rows.append({**common, "group": group, **aggregate})
 
@@ -341,6 +415,18 @@ def main() -> int:
         missing = [name for name in names if name not in runs]
         if missing:
             raise RuntimeError(f"{result_prefix} analysis requires all selected runs; missing: {missing}")
+    if args.paper_single_seed:
+        baseline_keys = {prediction_key(record) for record in runs[args.baseline]["predictions"]}
+        baseline_split = runs[args.baseline]["split"].get("splits")
+        for name in args.experiments:
+            keys = {prediction_key(record) for record in runs[name]["predictions"]}
+            if keys != baseline_keys:
+                raise RuntimeError(
+                    f"{name} test predictions do not match baseline: "
+                    f"{len(keys)} vs {len(baseline_keys)} samples"
+                )
+            if runs[name]["split"].get("splits") != baseline_split:
+                raise RuntimeError(f"{name} uses a different train/validation/test partition")
     write_summary(rows, report_root)
     make_figures(report_root, args.baseline, args.experiments, runs)
     if comparisons is not None:
@@ -354,31 +440,86 @@ def main() -> int:
                 if group != "overall":
                     left_records = [record for record in left_records if question_group(record) == group]
                     right_records = [record for record in right_records if question_group(record) == group]
-                metric, differences, _ = paired_metric(left_records, right_records)
+                metric, differences, paired_records = paired_metric(left_records, right_records)
                 comparison_rows.append({
                     "comparison": f"{left} vs {right}",
                     "group": group,
                     "paired_metric": metric,
-                    **paired_statistics(differences, args.bootstrap_samples, args.seed + comparison_index),
+                    **paired_statistics(
+                        differences, args.bootstrap_samples, args.seed + comparison_index,
+                        clusters=[str(record.get("audio_id")) for record in paired_records]
+                        if args.paper_single_seed else None,
+                    ),
                 })
         with (report_root / f"{result_prefix}_comparisons.json").open("w", encoding="utf-8") as handle:
             json.dump(comparison_rows, handle, ensure_ascii=False, indent=2)
-        recommended = runs.get("11_ds_temporal_post_bridge", {}).get("evaluation", {})
-        controls = [runs.get(name, {}).get("evaluation", {}) for name in followup_controls]
-        def score(item):
-            for key in ("bertscore_f1", "rouge_l", "meteor", "bleu"):
-                value = item.get(key)
-                if isinstance(value, (int, float)):
-                    return float(value)
-            return -float("inf")
-        eligible = bool(recommended) and all(control and score(recommended) > score(control) for control in controls)
-        rule = "11 must outperform " + ", ".join(followup_controls)
-        (report_root / f"{result_prefix}_followup.json").write_text(json.dumps({
-            "eligible": eligible,
-            "rule": rule + " before running seeds 3407 and 2026",
-            "experiments": ["00_baseline_peft", "11_ds_temporal_post_bridge", "12_cqt_temporal_post_bridge"],
-            "seeds": [3407, 2026],
-        }, ensure_ascii=False, indent=2), encoding="utf-8")
+        if args.paper_single_seed:
+            claim_names = {
+                "00_baseline_peft vs 11_ds_temporal_post_bridge": "DS temporal efficacy",
+                "09_ds_staged_global vs 10_ds_temporal_pre_proj": "temporal modeling benefit",
+                "10_ds_temporal_pre_proj vs 11_ds_temporal_post_bridge": "post-bridge placement",
+                "12_cqt_temporal_post_bridge vs 11_ds_temporal_post_bridge": "DS feature specificity",
+                "13_ds_temporal_shuffled_post_bridge vs 11_ds_temporal_post_bridge":
+                    "chronological-order contribution",
+            }
+            claims = []
+            for row in comparison_rows:
+                if row["group"] != "overall":
+                    continue
+                claims.append({
+                    "claim": claim_names[row["comparison"]],
+                    "comparison": row["comparison"],
+                    "metric": row.get("paired_metric"),
+                    "supported": (
+                        isinstance(row.get("paired_ci95_low"), (int, float))
+                        and row["paired_ci95_low"] > 0
+                    ),
+                    "ci95": [row.get("paired_ci95_low"), row.get("paired_ci95_high")],
+                    "paired_samples": row.get("paired_samples"),
+                })
+            claims_payload = {
+                    "primary_rule": (
+                        "audio-clustered paired bootstrap 95% CI lower bound must be above zero"
+                    ),
+                    "single_seed_limitation": (
+                        "Sample-level uncertainty only; training-seed variability is not estimated."
+                    ),
+                    "claims": claims,
+                    "core_efficacy_supported": next(
+                        item["supported"] for item in claims
+                        if item["claim"] == "DS temporal efficacy"
+                    ),
+                    "all_mechanism_claims_supported": all(
+                        item["supported"] for item in claims
+                        if item["claim"] != "DS temporal efficacy"
+                    ),
+                }
+            (report_root / "paper_single_seed_claims.json").write_text(
+                json.dumps(claims_payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        else:
+            recommended = runs.get("11_ds_temporal_post_bridge", {}).get("evaluation", {})
+            controls = [runs.get(name, {}).get("evaluation", {}) for name in followup_controls]
+            def score(item):
+                for key in ("bertscore_f1", "rouge_l", "meteor", "bleu"):
+                    value = item.get(key)
+                    if isinstance(value, (int, float)):
+                        return float(value)
+                return -float("inf")
+            eligible = bool(recommended) and all(
+                control and score(recommended) > score(control) for control in controls
+            )
+            rule = "11 must outperform " + ", ".join(followup_controls)
+            (report_root / f"{result_prefix}_followup.json").write_text(json.dumps({
+                "eligible": eligible,
+                "rule": rule + " before running seeds 3407 and 2026",
+                "experiments": [
+                    "00_baseline_peft", "11_ds_temporal_post_bridge",
+                    "12_cqt_temporal_post_bridge",
+                ],
+                "seeds": [3407, 2026],
+            }, ensure_ascii=False, indent=2), encoding="utf-8")
         (report_root / f"{result_prefix}_analysis_complete.json").write_text(json.dumps({
             "status": "completed", "experiments": [args.baseline, *args.experiments]
         }, ensure_ascii=False, indent=2), encoding="utf-8")
